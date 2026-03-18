@@ -8,3 +8,4 @@ bind = "0.0.0.0:5000"
 timeout = 120
 accesslog = "-"
 errorlog = "-"
+control_socket_disable = True
