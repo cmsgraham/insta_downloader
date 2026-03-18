@@ -6,8 +6,10 @@ services:
     environment:
       - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
       - FILE_TTL_SECONDS=3600
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
     volumes:
       - downloads:/app/downloads
+      - ./cookies.txt:/app/cookies.txt:ro
     restart: unless-stopped
 
 volumes:
