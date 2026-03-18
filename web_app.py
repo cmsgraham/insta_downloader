@@ -659,13 +659,25 @@ HTML_TEMPLATE = r"""
         display: block; font-size: 13px; color: var(--muted); margin-bottom: 8px;
         text-transform: uppercase; letter-spacing: 0.5px;
     }
+    .input-wrap {
+        position: relative; display: flex; align-items: center;
+    }
     .field input {
-        width: 100%; padding: 16px; background: var(--bg); border: 1px solid var(--border);
+        width: 100%; padding: 16px 44px 16px 16px; background: var(--bg); border: 1px solid var(--border);
         border-radius: 10px; color: var(--text); font-size: 16px; outline: none;
         transition: border-color 0.2s; font-family: inherit;
+        text-overflow: ellipsis; overflow: hidden; white-space: nowrap;
     }
     .field input:focus { border-color: var(--accent); }
     .field input::placeholder { color: #555; }
+    .clear-btn {
+        position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+        background: none; border: none; color: var(--muted); font-size: 20px;
+        cursor: pointer; padding: 4px 8px; line-height: 1; display: none;
+        -webkit-tap-highlight-color: transparent;
+    }
+    .clear-btn:hover { color: var(--text); }
+    .clear-btn.show { display: block; }
     .btn {
         width: 100%; padding: 16px;
         background: linear-gradient(45deg, var(--accent), var(--accent2));
@@ -683,6 +695,8 @@ HTML_TEMPLATE = r"""
     .file-list a {
         display: block; color: var(--accent); text-decoration: none;
         padding: 8px 0; font-size: 15px;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        max-width: 100%;
     }
     .file-list a:hover { text-decoration: underline; }
     .spinner {
@@ -713,7 +727,10 @@ HTML_TEMPLATE = r"""
     <div class="card">
         <div class="field">
             <label>Instagram URL</label>
-            <input type="url" id="url" placeholder="Paste link here..." autofocus>
+            <div class="input-wrap">
+                <input type="url" id="url" placeholder="Paste link here..." autofocus>
+                <button class="clear-btn" id="clearBtn" onclick="clearInput()" aria-label="Clear">&times;</button>
+            </div>
         </div>
         <button class="btn" id="downloadBtn" onclick="startDownload()">Download</button>
         <div class="status" id="status"></div>
@@ -822,7 +839,32 @@ function showCooldown(msg) {
     tick();
 }
 
-document.getElementById('url').addEventListener('keydown', e => { if (e.key === 'Enter') startDownload(); });
+const urlInput = document.getElementById('url');
+const clearBtn = document.getElementById('clearBtn');
+
+urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') startDownload(); });
+urlInput.addEventListener('input', () => { clearBtn.className = urlInput.value ? 'clear-btn show' : 'clear-btn'; });
+
+// On mobile focus: offer to paste from clipboard
+urlInput.addEventListener('focus', async () => {
+    if (urlInput.value) return;
+    try {
+        if (navigator.clipboard && navigator.clipboard.readText) {
+            const text = await navigator.clipboard.readText();
+            if (text && text.match(/instagram\.com\//i)) {
+                urlInput.value = text.trim();
+                clearBtn.className = 'clear-btn show';
+            }
+        }
+    } catch(e) { /* clipboard permission denied — ignore */ }
+});
+
+function clearInput() {
+    urlInput.value = '';
+    clearBtn.className = 'clear-btn';
+    urlInput.focus();
+    document.getElementById('status').className = 'status';
+}
 </script>
 </body>
 </html>
