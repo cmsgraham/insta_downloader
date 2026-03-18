@@ -571,6 +571,27 @@ def serve_file(filename):
     return send_from_directory(visitor["download_dir"], filename, as_attachment=True)
 
 
+@app.route("/robots.txt")
+def robots_txt():
+    return app.response_class(
+        "User-agent: *\nAllow: /\nDisallow: /api/\nDisallow: /downloads/\n\nSitemap: https://freeinsta.website/sitemap.xml\n",
+        mimetype="text/plain",
+    )
+
+
+@app.route("/sitemap.xml")
+def sitemap_xml():
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://freeinsta.website/</loc>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+</urlset>"""
+    return app.response_class(xml, mimetype="application/xml")
+
+
 # ──────────────────────────────────────────────
 #  HTML Template
 # ──────────────────────────────────────────────
@@ -581,7 +602,22 @@ HTML_TEMPLATE = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
-<title>FreeInsta — Download Instagram Content</title>
+<title>FreeInsta — Download Instagram Reels, Posts & Stories Free</title>
+<meta name="description" content="Download Instagram reels, posts, stories and photos for free. No login required. Just paste the link and download instantly.">
+<meta name="keywords" content="instagram downloader, download instagram reels, download instagram stories, save instagram posts, instagram video downloader, free instagram downloader">
+<link rel="canonical" href="https://freeinsta.website/">
+
+<!-- Open Graph -->
+<meta property="og:title" content="FreeInsta — Free Instagram Downloader">
+<meta property="og:description" content="Download Instagram reels, posts & stories for free. No login required.">
+<meta property="og:url" content="https://freeinsta.website/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="FreeInsta">
+
+<!-- Twitter Card -->
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="FreeInsta — Free Instagram Downloader">
+<meta name="twitter:description" content="Download Instagram reels, posts & stories for free. No login required.">
 <style>
     :root {
         --bg: #0a0a0a;
