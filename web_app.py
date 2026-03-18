@@ -1,0 +1,876 @@
+"""
+Instagram Downloader — Web Interface
+Uses Instagram's web API (v1) directly to fetch media info and download videos.
+No third-party Instagram libraries needed for downloading.
+"""
+
+import os
+import re
+import json
+import string
+import time
+import requests
+import threading
+import uuid
+from pathlib import Path
+
+from flask import Flask, render_template_string, request, jsonify, send_from_directory
+
+app = Flask(__name__)
+
+DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# In-memory job tracker: job_id -> {status, message, files}
+jobs = {}
+
+# Session state
+session_cookie = None   # raw sessionid string
+session_extras = {}     # csrftoken, ds_user_id, mid
+
+# Rate-limit cooldown: track when we last got a 429 so we don't keep hammering
+_rate_limit_until = 0   # epoch timestamp — skip requests until this time
+
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+
+
+def _load_cookies_file():
+    """Load session from Netscape cookies.txt if it exists."""
+    global session_cookie, session_extras
+    if not os.path.exists(COOKIES_FILE):
+        return False
+    cookies = {}
+    with open(COOKIES_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                cookies[parts[5]] = parts[6]
+    if "sessionid" in cookies:
+        session_cookie = cookies.pop("sessionid")
+        session_extras = {k: v for k, v in cookies.items()}
+        return True
+    return False
+
+
+# ──────────────────────────────────────────────
+#  Instagram helpers
+# ──────────────────────────────────────────────
+
+IG_APP_ID = "936619743392459"
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "X-IG-App-ID": IG_APP_ID,
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
+def _make_session():
+    """Build a requests.Session with the stored Instagram cookies."""
+    s = requests.Session()
+    s.headers.update(BASE_HEADERS)
+    if session_cookie:
+        s.cookies.set("sessionid", session_cookie, domain=".instagram.com")
+    for k, v in session_extras.items():
+        if v:
+            s.cookies.set(k, v, domain=".instagram.com")
+    return s
+
+
+def shortcode_to_media_id(shortcode):
+    """Convert an Instagram shortcode to a numeric media ID."""
+    alphabet = string.ascii_uppercase + string.ascii_lowercase + string.digits + "-_"
+    media_id = 0
+    for c in shortcode:
+        media_id = media_id * 64 + alphabet.index(c)
+    return media_id
+
+
+def parse_url(url):
+    """Parse an Instagram URL and return (content_type, identifier)."""
+    url = url.strip().rstrip("/")
+    # Post / Reel
+    m = re.match(r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels)/([A-Za-z0-9_-]+)", url)
+    if m:
+        return ("post", m.group(1))
+    # Single story
+    m = re.match(r"https?://(?:www\.)?instagram\.com/stories/([A-Za-z0-9._]+)/(\d+)", url)
+    if m:
+        return ("story", (m.group(1), m.group(2)))
+    # All stories from profile
+    m = re.match(r"https?://(?:www\.)?instagram\.com/stories/([A-Za-z0-9._]+)/?$", url)
+    if m:
+        return ("profile_stories", m.group(1))
+    # Profile URL -> treat as stories
+    m = re.match(r"https?://(?:www\.)?instagram\.com/([A-Za-z0-9._]+)/?$", url)
+    if m:
+        return ("profile_stories", m.group(1))
+    return (None, None)
+
+
+def _check_rate_limit():
+    """Raise immediately if we're still in a cooldown window."""
+    global _rate_limit_until
+    remaining = _rate_limit_until - time.time()
+    if remaining > 0:
+        raise ConnectionAbortedError(
+            f"Instagram rate-limited. Cooling down — try again in {int(remaining)+1}s."
+        )
+
+
+def _record_rate_limit(retry_after=None):
+    """Record a 429 and set a cooldown window."""
+    global _rate_limit_until
+    cooldown = int(retry_after) if retry_after else 60
+    _rate_limit_until = time.time() + cooldown
+
+
+def _fetch_media_v1(media_id):
+    """Fetch media info from the v1 API. Returns parsed JSON or raises."""
+    _check_rate_limit()
+    s = _make_session()
+    r = s.get(
+        f"https://www.instagram.com/api/v1/media/{media_id}/info/",
+        timeout=20,
+    )
+    if r.status_code == 429:
+        _record_rate_limit(r.headers.get("Retry-After"))
+        raise ConnectionAbortedError("v1 API rate-limited (429)")
+    if r.status_code != 200:
+        raise RuntimeError(f"v1 API returned status {r.status_code}")
+    content_type = r.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        raise RuntimeError(
+            "Instagram returned HTML instead of JSON. "
+            "This usually means your session is missing or expired. "
+            "Please import your Instagram session cookies first."
+        )
+    return r.json()
+
+
+def _fetch_media_graphql(shortcode):
+    """Fallback: fetch media via GraphQL using fb_dtsg token from page HTML."""
+    _check_rate_limit()
+    s = _make_session()
+    # Load the reel/post page to get fb_dtsg
+    page = s.get(f"https://www.instagram.com/p/{shortcode}/", timeout=20)
+    if page.status_code == 429:
+        _record_rate_limit(page.headers.get("Retry-After"))
+        raise ConnectionAbortedError("GraphQL page load rate-limited (429)")
+    if page.status_code != 200:
+        raise RuntimeError(f"Could not load post page (status {page.status_code})")
+    dtsg_match = re.search(r'"DTSGInitialData".*?"token"\s*:\s*"([^"]+)"', page.text)
+    if not dtsg_match:
+        raise RuntimeError("Could not extract fb_dtsg token from page")
+    fb_dtsg = dtsg_match.group(1)
+    csrf = s.cookies.get("csrftoken", domain=".instagram.com") or ""
+    r = s.post(
+        "https://www.instagram.com/graphql/query",
+        data={
+            "fb_dtsg": fb_dtsg,
+            "doc_id": "8845758582119845",
+            "variables": json.dumps({"shortcode": shortcode}),
+        },
+        headers={
+            "X-FB-Friendly-Name": "PolarisPostActionLoadPostQueryQuery",
+            "X-CSRFToken": csrf,
+            "Referer": f"https://www.instagram.com/p/{shortcode}/",
+        },
+        timeout=20,
+    )
+    if r.status_code == 429:
+        _record_rate_limit(r.headers.get("Retry-After"))
+        raise ConnectionAbortedError("GraphQL rate-limited (429)")
+    if r.status_code != 200 or not r.text:
+        raise RuntimeError(f"GraphQL returned status {r.status_code}")
+    content_type = r.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        raise RuntimeError("GraphQL returned HTML instead of JSON — session may be invalid.")
+    data = r.json()
+    media = data.get("data", {}).get("xdt_shortcode_media")
+    if not media:
+        raise RuntimeError(
+            "GraphQL returned null media. "
+            "Instagram now requires a valid session for all content. "
+            "Please import your session cookies."
+        )
+    # Normalize into v1-style format so download_media_item works
+    item = {"code": shortcode}
+    if media.get("is_video") and media.get("video_url"):
+        item["media_type"] = 2
+        item["video_versions"] = [{"url": media["video_url"], "width": 0, "height": 0}]
+    elif media.get("edge_sidecar_to_children"):
+        item["media_type"] = 8
+        item["carousel_media"] = []
+        for edge in media["edge_sidecar_to_children"].get("edges", []):
+            node = edge.get("node", {})
+            sub = {}
+            if node.get("is_video") and node.get("video_url"):
+                sub["media_type"] = 2
+                sub["video_versions"] = [{"url": node["video_url"], "width": 0, "height": 0}]
+            elif node.get("display_url"):
+                sub["media_type"] = 1
+                sub["image_versions2"] = {"candidates": [{"url": node["display_url"], "width": 0, "height": 0}]}
+            item["carousel_media"].append(sub)
+    elif media.get("display_url"):
+        item["media_type"] = 1
+        item["image_versions2"] = {"candidates": [{"url": media["display_url"], "width": 0, "height": 0}]}
+    return {"items": [item]}
+
+
+def fetch_media_info(media_id, shortcode=None):
+    """Fetch media info, trying v1 API first then GraphQL fallback."""
+    v1_err = None
+    gql_err = None
+
+    # Try v1 API with exponential backoff (3 attempts: 0s, 5s, 15s)
+    delays = [0, 5, 15]
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            return _fetch_media_v1(media_id)
+        except ConnectionAbortedError as e:
+            v1_err = e
+            continue  # retry with longer wait
+        except RuntimeError as e:
+            v1_err = e
+            break  # non-429 error, try GraphQL
+
+    # Fallback to GraphQL if we have a shortcode
+    if shortcode:
+        try:
+            return _fetch_media_graphql(shortcode)
+        except Exception as e:
+            gql_err = e
+
+    # Build a helpful error message
+    remaining = _rate_limit_until - time.time()
+    if remaining > 0:
+        raise ConnectionAbortedError(
+            f"Instagram rate-limited. Try again in ~{int(remaining)+1} seconds."
+        )
+    parts = ["Both v1 API and GraphQL failed."]
+    if v1_err:
+        parts.append(f"v1: {v1_err}")
+    if gql_err:
+        parts.append(f"GraphQL: {gql_err}")
+    parts.append("Wait a minute and try again.")
+    raise RuntimeError(" ".join(parts))
+
+
+def _fetch_user_id_v1(username):
+    """Resolve username via v1 web_profile_info API."""
+    s = _make_session()
+    r = s.get(
+        f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+        timeout=20,
+    )
+    if r.status_code == 429:
+        raise ConnectionAbortedError("v1 user lookup rate-limited (429)")
+    if r.status_code != 200:
+        raise RuntimeError(f"v1 user lookup returned status {r.status_code}")
+    content_type = r.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        raise RuntimeError("v1 user lookup returned HTML — session may be expired.")
+    data = r.json()
+    return data["data"]["user"]["id"]
+
+
+def _fetch_user_id_search(username):
+    """Resolve username via the search API (fallback when v1 is rate-limited)."""
+    s = _make_session()
+    r = s.get(
+        "https://www.instagram.com/web/search/topsearch/",
+        params={"query": username},
+        timeout=20,
+    )
+    if r.status_code == 429:
+        raise ConnectionAbortedError("Search API also rate-limited (429)")
+    if r.status_code != 200:
+        raise RuntimeError(f"Search API returned status {r.status_code}")
+    data = r.json()
+    for entry in data.get("users", []):
+        user = entry.get("user", {})
+        if user.get("username", "").lower() == username.lower():
+            return str(user["pk"])
+    raise RuntimeError(f"User '{username}' not found in search results.")
+
+
+def fetch_user_id(username):
+    """Resolve a username to a numeric user ID, trying v1 API then search fallback."""
+    # Try v1 API first
+    try:
+        uid = _fetch_user_id_v1(username)
+        print(f"[+] Resolved @{username} via v1 API → {uid}")
+        return uid
+    except ConnectionAbortedError as e:
+        print(f"[!] v1 user lookup failed: {e} — trying search fallback")
+    except RuntimeError as e:
+        print(f"[!] v1 user lookup failed: {e} — trying search fallback")
+
+    # Fallback to search API
+    try:
+        uid = _fetch_user_id_search(username)
+        print(f"[+] Resolved @{username} via search API → {uid}")
+        return uid
+    except ConnectionAbortedError:
+        _record_rate_limit()
+        raise ConnectionAbortedError(
+            "Instagram rate-limited on all endpoints. Try again in ~60 seconds."
+        )
+    except RuntimeError as e:
+        raise RuntimeError(f"Could not resolve user '{username}': {e}")
+
+
+def fetch_stories(user_id):
+    """Fetch current stories for a user. Returns list of story items."""
+    s = _make_session()
+    r = s.get(
+        f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}",
+        timeout=20,
+    )
+    if r.status_code == 429:
+        _record_rate_limit(r.headers.get("Retry-After"))
+        raise ConnectionAbortedError(
+            f"Instagram rate-limited. Try again in ~60 seconds."
+        )
+    if r.status_code != 200:
+        raise RuntimeError(f"Could not fetch stories (status {r.status_code})")
+    data = r.json()
+    reels = data.get("reels", {}) or data.get("reels_media", [])
+    if isinstance(reels, dict):
+        reel = reels.get(str(user_id), {})
+        return reel.get("items", [])
+    elif isinstance(reels, list):
+        for reel in reels:
+            if str(reel.get("id", "")) == str(user_id):
+                return reel.get("items", [])
+    return []
+
+
+def download_file(url, filepath):
+    """Download a URL to a local file."""
+    s = _make_session()
+    r = s.get(url, timeout=60, stream=True)
+    r.raise_for_status()
+    with open(filepath, "wb") as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            f.write(chunk)
+    return os.path.getsize(filepath)
+
+
+def pick_best_video(video_versions):
+    """Pick the highest resolution video from video_versions list."""
+    if not video_versions:
+        return None
+    return max(video_versions, key=lambda v: v.get("width", 0) * v.get("height", 0))
+
+
+def download_media_item(item, prefix=""):
+    """Download a single media item (post, reel, or story item). Returns list of filenames."""
+    files = []
+    media_type = item.get("media_type")
+    code = item.get("code", prefix or "unknown")
+
+    if media_type == 2 and "video_versions" in item:
+        # Video
+        best = pick_best_video(item["video_versions"])
+        if best:
+            fname = f"{code}.mp4"
+            fpath = os.path.join(DOWNLOAD_DIR, fname)
+            download_file(best["url"], fpath)
+            files.append(fname)
+    elif media_type == 8 and "carousel_media" in item:
+        # Carousel — download each item
+        for i, sub in enumerate(item["carousel_media"]):
+            sub_code = f"{code}_slide{i+1}"
+            if sub.get("media_type") == 2 and "video_versions" in sub:
+                best = pick_best_video(sub["video_versions"])
+                if best:
+                    fname = f"{sub_code}.mp4"
+                    fpath = os.path.join(DOWNLOAD_DIR, fname)
+                    download_file(best["url"], fpath)
+                    files.append(fname)
+            elif "image_versions2" in sub:
+                candidates = sub["image_versions2"].get("candidates", [])
+                if candidates:
+                    best_img = max(candidates, key=lambda c: c.get("width", 0) * c.get("height", 0))
+                    fname = f"{sub_code}.jpg"
+                    fpath = os.path.join(DOWNLOAD_DIR, fname)
+                    download_file(best_img["url"], fpath)
+                    files.append(fname)
+    elif media_type == 1 and "image_versions2" in item:
+        # Image post
+        candidates = item["image_versions2"].get("candidates", [])
+        if candidates:
+            best_img = max(candidates, key=lambda c: c.get("width", 0) * c.get("height", 0))
+            fname = f"{code}.jpg"
+            fpath = os.path.join(DOWNLOAD_DIR, fname)
+            download_file(best_img["url"], fpath)
+            files.append(fname)
+
+    return files
+
+
+def download_story_item(item, username="story"):
+    """Download a single story item. Returns list of filenames."""
+    files = []
+    story_id = item.get("pk", item.get("id", "unknown"))
+
+    if item.get("media_type") == 2 and "video_versions" in item:
+        best = pick_best_video(item["video_versions"])
+        if best:
+            fname = f"{username}_story_{story_id}.mp4"
+            fpath = os.path.join(DOWNLOAD_DIR, fname)
+            download_file(best["url"], fpath)
+            files.append(fname)
+    elif "image_versions2" in item:
+        candidates = item["image_versions2"].get("candidates", [])
+        if candidates:
+            best_img = max(candidates, key=lambda c: c.get("width", 0) * c.get("height", 0))
+            fname = f"{username}_story_{story_id}.jpg"
+            fpath = os.path.join(DOWNLOAD_DIR, fname)
+            download_file(best_img["url"], fpath)
+            files.append(fname)
+
+    return files
+
+
+# ──────────────────────────────────────────────
+#  Background download worker
+# ──────────────────────────────────────────────
+
+def run_download(job_id, url):
+    """Background worker that performs the download."""
+    try:
+        content_type, identifier = parse_url(url)
+        if content_type is None:
+            jobs[job_id] = {"status": "error", "message": f"Could not parse URL: {url}", "files": []}
+            return
+
+        if not session_cookie:
+            jobs[job_id] = {
+                "status": "error",
+                "message": "Instagram now requires login for all content (posts, reels, and stories). "
+                            "Please import your session cookies first using the 'Import Session' button above.",
+                "files": [],
+            }
+            return
+
+        all_files = []
+
+        if content_type == "post":
+            shortcode = identifier
+            media_id = shortcode_to_media_id(shortcode)
+            data = fetch_media_info(media_id, shortcode=shortcode)
+
+            if not data.get("items"):
+                jobs[job_id] = {"status": "error", "message": "Media not found or unavailable.", "files": []}
+                return
+
+            item = data["items"][0]
+            all_files = download_media_item(item, prefix=shortcode)
+
+        elif content_type == "story":
+            username, story_pk = identifier
+            user_id = fetch_user_id(username)
+            items = fetch_stories(user_id)
+
+            found = False
+            for item in items:
+                if str(item.get("pk")) == story_pk or str(item.get("id")) == story_pk:
+                    all_files = download_story_item(item, username)
+                    found = True
+                    break
+
+            if not found:
+                jobs[job_id] = {"status": "error", "message": f"Story {story_pk} not found. It may have expired.", "files": []}
+                return
+
+        elif content_type == "profile_stories":
+            username = identifier
+            user_id = fetch_user_id(username)
+            items = fetch_stories(user_id)
+
+            if not items:
+                jobs[job_id] = {"status": "error", "message": f"No active stories found for @{username}.", "files": []}
+                return
+
+            for item in items:
+                all_files.extend(download_story_item(item, username))
+
+        if all_files:
+            jobs[job_id] = {"status": "done", "message": f"Downloaded {len(all_files)} file(s).", "files": all_files}
+        else:
+            jobs[job_id] = {"status": "done", "message": "No downloadable media found.", "files": []}
+
+    except ConnectionAbortedError as e:
+        jobs[job_id] = {"status": "error", "message": str(e), "files": []}
+    except Exception as e:
+        jobs[job_id] = {"status": "error", "message": str(e), "files": []}
+
+
+# ──────────────────────────────────────────────
+#  Routes
+# ──────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+
+@app.route("/api/download", methods=["POST"])
+def api_download():
+    data = request.get_json(force=True)
+    url = data.get("url", "").strip()
+
+    if not url:
+        return jsonify({"error": "URL is required"}), 400
+
+    job_id = uuid.uuid4().hex[:12]
+    jobs[job_id] = {"status": "working", "message": "Downloading...", "files": []}
+
+    thread = threading.Thread(target=run_download, args=(job_id, url), daemon=True)
+    thread.start()
+
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/status/<job_id>")
+def api_status(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(job)
+
+
+@app.route("/api/import-session", methods=["POST"])
+def api_import_session():
+    """Import a session from browser cookies."""
+    global session_cookie, session_extras
+    data = request.get_json(force=True)
+    sessionid = data.get("sessionid", "").strip()
+    csrftoken = data.get("csrftoken", "").strip()
+    ds_user_id = data.get("ds_user_id", "").strip()
+
+    if not sessionid:
+        return jsonify({"error": "sessionid cookie is required"}), 400
+    if len(sessionid) < 10:
+        return jsonify({"error": "sessionid looks too short - double-check the value"}), 400
+
+    session_cookie = sessionid
+    session_extras = {}
+    if csrftoken:
+        session_extras["csrftoken"] = csrftoken
+    if ds_user_id:
+        session_extras["ds_user_id"] = ds_user_id
+
+    return jsonify({"ok": True, "message": "Session imported successfully! You're now logged in."})
+
+
+@app.route("/api/session-status")
+def api_session_status():
+    remaining = max(0, int(_rate_limit_until - time.time()))
+    return jsonify({
+        "logged_in": session_cookie is not None,
+        "user": session_extras.get("ds_user_id", "imported") if session_cookie else None,
+        "cooldown": remaining,
+    })
+
+
+@app.route("/downloads/<path:filename>")
+def serve_file(filename):
+    return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
+
+
+# ──────────────────────────────────────────────
+#  HTML Template
+# ──────────────────────────────────────────────
+
+HTML_TEMPLATE = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Instagram Downloader</title>
+<style>
+    :root {
+        --bg: #0a0a0a;
+        --card: #161616;
+        --border: #2a2a2a;
+        --accent: #e1306c;
+        --accent2: #833ab4;
+        --text: #f5f5f5;
+        --muted: #888;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .container { width: 100%; max-width: 560px; padding: 20px; }
+    .logo { text-align: center; margin-bottom: 30px; }
+    .logo h1 {
+        font-size: 28px;
+        background: linear-gradient(45deg, var(--accent), var(--accent2));
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    .logo p { color: var(--muted); font-size: 14px; margin-top: 6px; }
+    .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 28px;
+        margin-bottom: 16px;
+    }
+    .session-bar {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 10px 14px; border-radius: 10px; margin-bottom: 18px; font-size: 13px;
+    }
+    .session-bar.logged-in { background: #0a2e1a; border: 1px solid #1a5e3a; }
+    .session-bar.logged-out { background: #2e1a0a; border: 1px solid #5e3a1a; }
+    .session-bar .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+    .session-bar .dot.green { background: #4caf50; }
+    .session-bar .dot.orange { background: #ff9800; }
+    .field { margin-bottom: 18px; }
+    .field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .field input {
+        width: 100%; padding: 12px 14px; background: var(--bg); border: 1px solid var(--border);
+        border-radius: 10px; color: var(--text); font-size: 15px; outline: none; transition: border-color 0.2s; font-family: inherit;
+    }
+    .field input:focus { border-color: var(--accent); }
+    .field input::placeholder { color: #555; }
+    .field .hint-text { font-size: 11px; color: var(--muted); margin-top: 4px; }
+    .toggle-btn { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 13px; }
+    .toggle-btn:hover { text-decoration: underline; }
+    .collapsible { display: none; }
+    .collapsible.open { display: block; }
+    .btn {
+        width: 100%; padding: 14px;
+        background: linear-gradient(45deg, var(--accent), var(--accent2));
+        color: #fff; border: none; border-radius: 10px; font-size: 16px; font-weight: 600;
+        cursor: pointer; transition: opacity 0.2s;
+    }
+    .btn:hover { opacity: 0.9; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status { margin-top: 20px; padding: 14px; border-radius: 10px; font-size: 14px; display: none; }
+    .status.show { display: block; }
+    .status.working { background: #1a1a2e; border: 1px solid #333; }
+    .status.done { background: #0a2e1a; border: 1px solid #1a5e3a; }
+    .status.error { background: #2e0a0a; border: 1px solid #5e1a1a; }
+    .file-list { margin-top: 10px; }
+    .file-list a { display: block; color: var(--accent); text-decoration: none; padding: 6px 0; font-size: 14px; }
+    .file-list a:hover { text-decoration: underline; }
+    .spinner {
+        display: inline-block; width: 16px; height: 16px;
+        border: 2px solid var(--muted); border-top-color: var(--accent);
+        border-radius: 50%; animation: spin 0.8s linear infinite;
+        vertical-align: middle; margin-right: 8px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .steps {
+        background: #111; border: 1px solid var(--border); border-radius: 10px;
+        padding: 16px; margin: 14px 0; font-size: 13px; line-height: 1.8;
+    }
+    .steps ol { padding-left: 20px; }
+    .steps code { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 12px; color: var(--accent); }
+    .footer-hint { text-align: center; margin-top: 16px; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="container">
+    <div class="logo">
+        <h1>Instagram Downloader</h1>
+        <p>Paste a link to download reels, posts, or stories</p>
+    </div>
+
+    <div id="sessionBar" class="session-bar logged-out">
+        <span><span class="dot orange" id="statusDot"></span> <span id="sessionText">Not logged in — session required for all downloads</span></span>
+        <button class="toggle-btn" onclick="toggleImport()" id="importToggleBtn">Import Session</button>
+    </div>
+
+    <div class="card collapsible" id="importCard">
+        <div class="steps">
+            <strong>How to get your session cookie:</strong>
+            <ol>
+                <li>Open <a href="https://www.instagram.com" target="_blank" style="color:var(--accent)">instagram.com</a> in your browser and <strong>log in normally</strong></li>
+                <li>Press <code>F12</code> to open DevTools</li>
+                <li>Go to <strong>Application</strong> tab &rarr; <strong>Cookies</strong> &rarr; <code>https://www.instagram.com</code></li>
+                <li>Find and copy the <code>sessionid</code> cookie value</li>
+                <li>Paste it below and click Import</li>
+            </ol>
+        </div>
+        <div class="field">
+            <label>sessionid <span style="color:var(--accent)">*</span></label>
+            <input type="text" id="sessionid" placeholder="Paste your sessionid cookie here">
+        </div>
+        <div class="field">
+            <label>csrftoken <span style="color:var(--muted)">(optional)</span></label>
+            <input type="text" id="csrftoken" placeholder="csrftoken cookie value">
+            <div class="hint-text">Also from the same cookies list. Helps with reliability.</div>
+        </div>
+        <div class="field">
+            <label>ds_user_id <span style="color:var(--muted)">(optional)</span></label>
+            <input type="text" id="ds_user_id" placeholder="ds_user_id cookie value">
+        </div>
+        <button class="btn" onclick="importSession()" id="importBtn">Import Session</button>
+        <div class="status" id="importStatus"></div>
+    </div>
+
+    <div class="card">
+        <div class="field">
+            <label>Instagram URL</label>
+            <input type="text" id="url" placeholder="https://www.instagram.com/reel/..." autofocus>
+        </div>
+        <button class="btn" id="downloadBtn" onclick="startDownload()">Download</button>
+        <div class="status" id="status"></div>
+    </div>
+
+    <div class="footer-hint">Supports: posts, reels, stories &bull; Files saved to <code>downloads/</code></div>
+</div>
+
+<script>
+async function checkSession() {
+    try {
+        const resp = await fetch('/api/session-status');
+        const data = await resp.json();
+        const bar = document.getElementById('sessionBar');
+        const dot = document.getElementById('statusDot');
+        const text = document.getElementById('sessionText');
+        const btn = document.getElementById('importToggleBtn');
+        if (data.logged_in) {
+            bar.className = 'session-bar logged-in';
+            dot.className = 'dot green';
+            text.textContent = 'Logged in';
+            btn.textContent = 'Change Session';
+            document.getElementById('importCard').classList.remove('open');
+        } else {
+            bar.className = 'session-bar logged-out';
+            dot.className = 'dot orange';
+            text.textContent = 'Not logged in \u2014 session required for all downloads';
+            btn.textContent = 'Import Session';
+            document.getElementById('importCard').classList.add('open');
+        }
+    } catch(e) {}
+}
+checkSession();
+
+function toggleImport() { document.getElementById('importCard').classList.toggle('open'); }
+
+async function importSession() {
+    const sessionid = document.getElementById('sessionid').value.trim();
+    const csrftoken = document.getElementById('csrftoken').value.trim();
+    const ds_user_id = document.getElementById('ds_user_id').value.trim();
+    const statusEl = document.getElementById('importStatus');
+    const btn = document.getElementById('importBtn');
+    if (!sessionid) { alert('Please paste your sessionid cookie.'); return; }
+    btn.disabled = true; btn.textContent = 'Importing...';
+    statusEl.className = 'status show working';
+    statusEl.innerHTML = '<span class="spinner"></span> Importing session...';
+    try {
+        const resp = await fetch('/api/import-session', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ sessionid, csrftoken, ds_user_id })
+        });
+        const data = await resp.json();
+        if (data.ok) { statusEl.className = 'status show done'; statusEl.textContent = data.message; checkSession(); }
+        else { statusEl.className = 'status show error'; statusEl.textContent = data.error || 'Import failed'; }
+    } catch(e) { statusEl.className = 'status show error'; statusEl.textContent = 'Request failed: ' + e.message; }
+    btn.disabled = false; btn.textContent = 'Import Session';
+}
+
+async function startDownload() {
+    const btn = document.getElementById('downloadBtn');
+    const statusEl = document.getElementById('status');
+    const url = document.getElementById('url').value.trim();
+    if (!url) { alert('Please paste an Instagram URL.'); return; }
+    btn.disabled = true; btn.textContent = 'Downloading...';
+    statusEl.className = 'status show working';
+    statusEl.innerHTML = '<span class="spinner"></span> Starting download...';
+    try {
+        const resp = await fetch('/api/download', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ url })
+        });
+        const data = await resp.json();
+        if (data.error) { statusEl.className = 'status show error'; statusEl.textContent = data.error; btn.disabled = false; btn.textContent = 'Download'; return; }
+        pollStatus(data.job_id);
+    } catch(e) { statusEl.className = 'status show error'; statusEl.textContent = 'Request failed: ' + e.message; btn.disabled = false; btn.textContent = 'Download'; }
+}
+
+function pollStatus(jobId) {
+    const statusEl = document.getElementById('status');
+    const btn = document.getElementById('downloadBtn');
+    const interval = setInterval(async () => {
+        try {
+            const resp = await fetch('/api/status/' + jobId);
+            const data = await resp.json();
+            if (data.status === 'working') { statusEl.innerHTML = '<span class="spinner"></span> ' + data.message; return; }
+            clearInterval(interval); btn.disabled = false; btn.textContent = 'Download';
+            if (data.status === 'done') {
+                statusEl.className = 'status show done';
+                let html = data.message;
+                if (data.files && data.files.length > 0) {
+                    html += '<div class="file-list">';
+                    data.files.forEach(f => { html += '<a href="/downloads/' + encodeURIComponent(f) + '">' + f + '</a>'; });
+                    html += '</div>';
+                }
+                statusEl.innerHTML = html;
+            } else if (data.message && data.message.toLowerCase().includes('rate-limit')) {
+                showCooldown(data.message);
+            } else { statusEl.className = 'status show error'; statusEl.textContent = data.message; }
+        } catch(e) { clearInterval(interval); statusEl.className = 'status show error'; statusEl.textContent = 'Polling failed: ' + e.message; btn.disabled = false; btn.textContent = 'Download'; }
+    }, 1500);
+}
+
+function showCooldown(msg) {
+    const statusEl = document.getElementById('status');
+    const btn = document.getElementById('downloadBtn');
+    statusEl.className = 'status show error';
+    // Extract seconds from message like "try again in ~60 seconds" or "try again in 45s"
+    const match = msg.match(/(\d+)\s*s/i);
+    let secs = match ? parseInt(match[1]) : 60;
+    const tick = () => {
+        if (secs <= 0) {
+            statusEl.innerHTML = 'Cooldown over — retrying now...';
+            statusEl.className = 'status show working';
+            startDownload();
+            return;
+        }
+        statusEl.innerHTML = '\u23f3 Rate-limited by Instagram. Auto-retry in <strong>' + secs + 's</strong>...&nbsp; <button onclick="startDownload()" style="background:none;border:1px solid var(--accent);color:var(--accent);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:13px">Retry Now</button>';
+        secs--;
+        setTimeout(tick, 1000);
+    };
+    tick();
+}
+
+document.getElementById('url').addEventListener('keydown', e => { if (e.key === 'Enter') startDownload(); });
+document.getElementById('sessionid').addEventListener('keydown', e => { if (e.key === 'Enter') importSession(); });
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    # Auto-load cookies on startup
+    if _load_cookies_file():
+        print(f"[+] Loaded session from cookies.txt (user {session_extras.get('ds_user_id', '?')})")
+    else:
+        print("[!] No cookies.txt found — import session via the web UI")
+    print("=" * 45)
+    print("  Instagram Downloader - Web Interface")
+    print("  Open http://localhost:5000 in your browser")
+    print("=" * 45)
+    app.run(host="127.0.0.1", port=5000, debug=False)

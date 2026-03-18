@@ -1,0 +1,18 @@
+# Sensitive files
+cookies.txt
+sessions/
+
+# Downloads
+downloads/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
