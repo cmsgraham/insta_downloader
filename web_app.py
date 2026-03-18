@@ -706,8 +706,8 @@ HTML_TEMPLATE = r"""
 <body>
 <div class="container">
     <div class="logo">
-        <h1>FreeInsta</h1>
-        <p>Download reels, posts &amp; stories from Instagram</p>
+        <h1>Free Instagram Downloader</h1>
+        <p>Download reels, posts &amp; stories — no login required</p>
     </div>
 
     <div class="card">
