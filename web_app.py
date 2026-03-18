@@ -1,6 +1,7 @@
 """
-Instagram Downloader — Public Web Service
-Server uses the owner's cookies.txt for all requests.
+Instagram, Twitter/X & YouTube Downloader — Public Web Service
+Server uses the owner's cookies.txt for Instagram requests.
+Twitter/X and YouTube downloads use yt-dlp (no auth required).
 Visitors just paste a URL and hit Download.
 """
 
@@ -16,6 +17,7 @@ import uuid
 import hmac
 from pathlib import Path
 
+import yt_dlp
 from flask import Flask, render_template_string, request, jsonify, session, send_from_directory
 
 app = Flask(__name__)
@@ -150,6 +152,7 @@ def shortcode_to_media_id(shortcode):
 
 def parse_url(url):
     url = url.strip().rstrip("/")
+    # Instagram URLs
     m = re.match(r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels)/([A-Za-z0-9_-]+)", url)
     if m:
         return ("post", m.group(1))
@@ -162,6 +165,24 @@ def parse_url(url):
     m = re.match(r"https?://(?:www\.)?instagram\.com/([A-Za-z0-9._]+)/?$", url)
     if m:
         return ("profile_stories", m.group(1))
+    # Twitter/X URLs
+    m = re.match(r"https?://(?:www\.)?(?:twitter\.com|x\.com)/([A-Za-z0-9_]+)/status/(\d+)", url)
+    if m:
+        return ("tweet", (m.group(1), m.group(2)))
+    # t.co and other Twitter short URLs
+    m = re.match(r"https?://t\.co/[A-Za-z0-9]+", url)
+    if m:
+        return ("tweet_short", url)
+    # YouTube URLs
+    m = re.match(r"https?://(?:www\.)?youtube\.com/watch\?.*v=([A-Za-z0-9_-]{11})", url)
+    if m:
+        return ("youtube", m.group(1))
+    m = re.match(r"https?://youtu\.be/([A-Za-z0-9_-]{11})", url)
+    if m:
+        return ("youtube", m.group(1))
+    m = re.match(r"https?://(?:www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{11})", url)
+    if m:
+        return ("youtube", m.group(1))
     return (None, None)
 
 
@@ -424,6 +445,62 @@ def download_story_item(item, dl_dir, username="story"):
 
 
 # ──────────────────────────────────────────────
+#  Twitter/X helpers (using yt-dlp)
+# ──────────────────────────────────────────────
+
+def _resolve_short_url(url):
+    """Resolve t.co short URLs to full Twitter/X URLs."""
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=10)
+        return r.url
+    except Exception:
+        return url
+
+
+def _ydl_download(url, dl_dir, allowed_extractors, error_label="video"):
+    """Generic yt-dlp download. Returns list of filenames."""
+    files = []
+    temp_prefix = uuid.uuid4().hex[:8]
+    output_template = os.path.join(dl_dir, f"{temp_prefix}_%(id)s.%(ext)s")
+
+    ydl_opts = {
+        "outtmpl": output_template,
+        "format": "best[ext=mp4]/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 2,
+        "allowed_extractors": allowed_extractors,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info is None:
+            raise RuntimeError(f"Could not extract {error_label} info from this URL.")
+
+        entries = info.get("entries", [info]) if "entries" in info else [info]
+        for entry in entries:
+            filename = ydl.prepare_filename(entry)
+            if os.path.exists(filename):
+                files.append(os.path.basename(filename))
+
+    if not files:
+        raise RuntimeError(f"No downloadable {error_label} found.")
+    return files
+
+
+def download_twitter_video(tweet_url, dl_dir):
+    """Download video from a tweet using yt-dlp."""
+    return _ydl_download(tweet_url, dl_dir, ["twitter", "twitter:card"], "video")
+
+
+def download_youtube_video(video_url, dl_dir):
+    """Download video from YouTube using yt-dlp."""
+    return _ydl_download(video_url, dl_dir, ["youtube", "youtube:tab"], "video")
+
+
+# ──────────────────────────────────────────────
 #  Background download worker
 # ──────────────────────────────────────────────
 
@@ -431,17 +508,36 @@ def run_download(job_id, url, visitor):
     try:
         content_type, identifier = parse_url(url)
         if content_type is None:
-            visitor["jobs"][job_id] = {"status": "error", "message": f"Could not parse URL: {url}", "files": []}
-            return
-
-        if not _server_session["ig_sessionid"]:
-            visitor["jobs"][job_id] = {"status": "error", "message": "Service temporarily unavailable.", "files": []}
+            visitor["jobs"][job_id] = {"status": "error", "message": "Could not parse URL. Supported: Instagram, Twitter/X & YouTube links.", "files": []}
             return
 
         dl_dir = visitor["download_dir"]
         all_files = []
 
-        if content_type == "post":
+        # ── YouTube downloads ──
+        if content_type == "youtube":
+            video_id = identifier
+            yt_url = f"https://www.youtube.com/watch?v={video_id}"
+            all_files = download_youtube_video(yt_url, dl_dir)
+
+        # ── Twitter/X downloads ──
+        elif content_type in ("tweet", "tweet_short"):
+            if content_type == "tweet_short":
+                url = _resolve_short_url(identifier)
+                content_type2, identifier2 = parse_url(url)
+                if content_type2 != "tweet":
+                    visitor["jobs"][job_id] = {"status": "error", "message": "Could not resolve short URL to a tweet.", "files": []}
+                    return
+                identifier = identifier2
+            username, tweet_id = identifier
+            tweet_url = f"https://x.com/{username}/status/{tweet_id}"
+            all_files = download_twitter_video(tweet_url, dl_dir)
+
+        # ── Instagram downloads ──
+        elif content_type == "post":
+            if not _server_session["ig_sessionid"]:
+                visitor["jobs"][job_id] = {"status": "error", "message": "Instagram service temporarily unavailable.", "files": []}
+                return
             shortcode = identifier
             media_id = shortcode_to_media_id(shortcode)
             data = fetch_media_info(media_id, shortcode=shortcode)
@@ -452,6 +548,9 @@ def run_download(job_id, url, visitor):
             all_files = download_media_item(item, dl_dir, prefix=shortcode)
 
         elif content_type == "story":
+            if not _server_session["ig_sessionid"]:
+                visitor["jobs"][job_id] = {"status": "error", "message": "Instagram service temporarily unavailable.", "files": []}
+                return
             username, story_pk = identifier
             ig_user_id = fetch_user_id(username)
             items = fetch_stories(ig_user_id)
@@ -466,6 +565,9 @@ def run_download(job_id, url, visitor):
                 return
 
         elif content_type == "profile_stories":
+            if not _server_session["ig_sessionid"]:
+                visitor["jobs"][job_id] = {"status": "error", "message": "Instagram service temporarily unavailable.", "files": []}
+                return
             username = identifier
             ig_user_id = fetch_user_id(username)
             items = fetch_stories(ig_user_id)
@@ -574,7 +676,7 @@ def serve_file(filename):
 @app.route("/robots.txt")
 def robots_txt():
     return app.response_class(
-        "User-agent: *\nAllow: /\nDisallow: /api/\nDisallow: /downloads/\n\nSitemap: https://freeinsta.website/sitemap.xml\n",
+        "User-agent: *\nAllow: /\nDisallow: /api/\nDisallow: /downloads/\n\nSitemap: https://freedl.website/sitemap.xml\n",
         mimetype="text/plain",
     )
 
@@ -584,7 +686,7 @@ def sitemap_xml():
     xml = """<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
-    <loc>https://freeinsta.website/</loc>
+    <loc>https://freedl.website/</loc>
     <changefreq>weekly</changefreq>
     <priority>1.0</priority>
   </url>
@@ -602,22 +704,22 @@ HTML_TEMPLATE = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
-<title>FreeInsta — Download Instagram Reels, Posts & Stories Free</title>
-<meta name="description" content="Download Instagram reels, posts, stories and photos for free. No login required. Just paste the link and download instantly.">
-<meta name="keywords" content="instagram downloader, download instagram reels, download instagram stories, save instagram posts, instagram video downloader, free instagram downloader">
-<link rel="canonical" href="https://freeinsta.website/">
+<title>FreeDL — Download Instagram, Twitter/X & YouTube Videos Free</title>
+<meta name="description" content="Download Instagram reels, posts, stories, Twitter/X videos and YouTube videos for free. No login required. Just paste the link and download instantly.">
+<meta name="keywords" content="video downloader, instagram downloader, download instagram reels, download instagram stories, save instagram posts, instagram video downloader, twitter video downloader, x video downloader, download twitter videos, youtube downloader, download youtube videos, youtube shorts downloader, free video downloader">
+<link rel="canonical" href="https://freedl.website/">
 
 <!-- Open Graph -->
-<meta property="og:title" content="FreeInsta — Free Instagram Downloader">
-<meta property="og:description" content="Download Instagram reels, posts & stories for free. No login required.">
-<meta property="og:url" content="https://freeinsta.website/">
+<meta property="og:title" content="FreeDL — Free Instagram, Twitter/X & YouTube Downloader">
+<meta property="og:description" content="Download Instagram reels, posts, stories, Twitter/X & YouTube videos for free. No login required.">
+<meta property="og:url" content="https://freedl.website/">
 <meta property="og:type" content="website">
-<meta property="og:site_name" content="FreeInsta">
+<meta property="og:site_name" content="FreeDL">
 
 <!-- Twitter Card -->
 <meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="FreeInsta — Free Instagram Downloader">
-<meta name="twitter:description" content="Download Instagram reels, posts & stories for free. No login required.">
+<meta name="twitter:title" content="FreeDL — Free Instagram, Twitter/X & YouTube Downloader">
+<meta name="twitter:description" content="Download Instagram reels, posts, stories, Twitter/X & YouTube videos for free. No login required.">
 <style>
     :root {
         --bg: #0a0a0a;
@@ -642,8 +744,8 @@ HTML_TEMPLATE = r"""
     .container { width: 100%; max-width: 520px; }
     .logo { text-align: center; margin-bottom: 32px; }
     .logo h1 {
-        font-size: 28px;
-        background: linear-gradient(45deg, var(--accent), var(--accent2));
+        font-size: 24px;
+        background: linear-gradient(45deg, var(--accent), var(--accent2), #1da1f2, #ff0000);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
     }
@@ -720,15 +822,15 @@ HTML_TEMPLATE = r"""
 <body>
 <div class="container">
     <div class="logo">
-        <h1>Free Instagram Downloader</h1>
-        <p>Download reels, posts &amp; stories — no login required</p>
+        <h1>FreeDL — Video Downloader</h1>
+        <p>Download from Instagram, Twitter/X &amp; YouTube — no login required</p>
     </div>
 
     <div class="card">
         <div class="field">
-            <label>Instagram URL</label>
+            <label>Instagram, Twitter/X or YouTube URL</label>
             <div class="input-wrap">
-                <input type="url" id="url" placeholder="Paste link here..." autofocus>
+                <input type="url" id="url" placeholder="Paste Instagram, Twitter/X or YouTube link here..." autofocus>
                 <button class="clear-btn" id="clearBtn" onclick="clearInput()" aria-label="Clear">&times;</button>
             </div>
         </div>
@@ -740,6 +842,8 @@ HTML_TEMPLATE = r"""
         <span>&#127910; Reels</span>
         <span>&#128247; Posts</span>
         <span>&#128248; Stories</span>
+        <span>&#128038; Twitter/X</span>
+        <span>&#9654;&#65039; YouTube</span>
     </div>
 
     <div class="footer">
@@ -756,7 +860,10 @@ async function startDownload() {
     if (!url) return;
     btn.disabled = true; btn.textContent = 'Downloading...';
     statusEl.className = 'status show working';
-    statusEl.innerHTML = '<span class="spinner"></span> Fetching from Instagram...';
+    const isTwitter = url.match(/twitter\.com|x\.com|t\.co/i);
+    const isYouTube = url.match(/youtube\.com|youtu\.be/i);
+    const source = isYouTube ? 'YouTube' : isTwitter ? 'Twitter/X' : 'Instagram';
+    statusEl.innerHTML = '<span class="spinner"></span> Fetching from ' + source + '...';
     try {
         const resp = await fetch('/api/download', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -851,7 +958,7 @@ urlInput.addEventListener('focus', async () => {
     try {
         if (navigator.clipboard && navigator.clipboard.readText) {
             const text = await navigator.clipboard.readText();
-            if (text && text.match(/instagram\.com\//i)) {
+            if (text && text.match(/instagram\.com\/|twitter\.com\/|x\.com\/|youtube\.com\/|youtu\.be\//i)) {
                 urlInput.value = text.trim();
                 clearBtn.className = 'clear-btn show';
             }
@@ -875,7 +982,7 @@ if __name__ == "__main__":
     import socket
     local_ip = socket.gethostbyname(socket.gethostname())
     print("=" * 45)
-    print("  FreeInsta — Instagram Downloader")
+    print("  FreeDL — Instagram, Twitter/X & YouTube Downloader")
     print(f"  Local:   http://localhost:5000")
     print(f"  Network: http://{local_ip}:5000")
     print("=" * 45)

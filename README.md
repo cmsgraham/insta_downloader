@@ -1,21 +1,43 @@
-# Instagram Video Downloader
+# FreeDL — Video Downloader
 
-Download videos from Instagram — **stories**, **reels**, and **posts** — via the command line.  
-Supports login for accessing **private accounts** and **stories**.
+Download videos from **Instagram**, **Twitter/X**, and **YouTube** — via the web app or command line.
 
-## Setup
+## Web App
+
+The main interface is a self-hosted web app. Users paste a URL and download instantly.
+
+**Supported platforms:**
+- **Instagram** — reels, posts (images + video), stories (requires server cookies)
+- **Twitter/X** — tweet videos (`twitter.com`, `x.com`, `t.co` short links)
+- **YouTube** — videos, shorts (`youtube.com`, `youtu.be`)
+
+### Running with Docker
 
 ```bash
-# Create a virtual environment (recommended)
-python3 -m venv venv
-source venv/bin/activate    # Linux/Mac
-# venv\Scripts\activate     # Windows
-
-# Install dependencies
-pip install -r requirements.txt
+docker compose up -d
 ```
 
-## Usage
+The web app will be available at `http://localhost:5000`.
+
+### Environment variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SECRET_KEY` | Flask secret key | random |
+| `FILE_TTL_SECONDS` | Auto-delete downloads after N seconds | `3600` |
+| `ADMIN_TOKEN` | Bearer token for `/api/admin/reload-cookies` | — |
+| `COOKIES_FILE` | Path to Instagram cookies.txt | `/app/cookies.txt` |
+| `RATE_LIMIT_PER_MIN` | Max downloads per visitor per minute | `10` |
+
+### Instagram cookies
+
+Instagram downloads require a `cookies.txt` file with a valid session. Export it from your browser (Netscape format) and place it in the project root.
+
+---
+
+## CLI Downloader (Instagram only)
+
+The `downloader.py` script provides command-line Instagram downloads with login support.
 
 ```
 python3 downloader.py <URL> [options]
@@ -51,28 +73,26 @@ python3 downloader.py https://www.instagram.com/stories/someuser/1234567890/ -u 
 python3 downloader.py https://www.instagram.com/someuser/ -u your_username
 ```
 
-**Save session to avoid re-entering password:**
-```bash
-# First time — prompts for password, saves session
-python3 downloader.py https://www.instagram.com/reel/ABC123/ -u your_username -s my_session
-
-# Next time — reuses saved session, no password prompt
-python3 downloader.py https://www.instagram.com/reel/XYZ789/ -u your_username -s my_session
-```
+---
 
 ## Supported URL Formats
 
-| Type | URL Pattern |
-|------|------------|
-| Post | `https://www.instagram.com/p/SHORTCODE/` |
-| Reel | `https://www.instagram.com/reel/SHORTCODE/` |
-| Story | `https://www.instagram.com/stories/USERNAME/STORY_ID/` |
-| All stories | `https://www.instagram.com/USERNAME/` |
+| Platform | Type | URL Pattern |
+|----------|------|------------|
+| Instagram | Post | `https://www.instagram.com/p/SHORTCODE/` |
+| Instagram | Reel | `https://www.instagram.com/reel/SHORTCODE/` |
+| Instagram | Story | `https://www.instagram.com/stories/USERNAME/STORY_ID/` |
+| Instagram | All stories | `https://www.instagram.com/USERNAME/` |
+| Twitter/X | Tweet | `https://twitter.com/USER/status/ID` |
+| Twitter/X | Tweet | `https://x.com/USER/status/ID` |
+| YouTube | Video | `https://www.youtube.com/watch?v=VIDEO_ID` |
+| YouTube | Short | `https://youtube.com/shorts/VIDEO_ID` |
+| YouTube | Short link | `https://youtu.be/VIDEO_ID` |
 
 ## Notes
 
-- **Stories require login** — Instagram doesn't expose stories without authentication.
-- **Private accounts require login** — you must follow the account and log in with your credentials.
-- **2FA is supported** — if your account uses two-factor auth, you'll be prompted for the code.
-- **Session files** store your login cookies locally so you don't need to enter your password every time. Keep them secure.
-- Downloaded files go into the `downloads/` folder by default (configurable with `-o`).
+- **Instagram stories require cookies** — Instagram doesn't expose stories without authentication.
+- **Private Instagram accounts require cookies** — your session must follow the account.
+- **Twitter/X and YouTube** downloads use `yt-dlp` and require **no authentication**.
+- **2FA is supported** for the CLI downloader.
+- Downloaded files auto-expire after 1 hour (configurable).
