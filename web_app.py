@@ -457,7 +457,18 @@ def _resolve_short_url(url):
         return url
 
 
-def _ydl_download(url, dl_dir, allowed_extractors, error_label="video"):
+def _find_youtube_cookies():
+    """Locate youtube_cookies.txt file."""
+    path = os.environ.get("YOUTUBE_COOKIES_FILE", "/app/youtube_cookies.txt")
+    if os.path.exists(path):
+        return path
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "youtube_cookies.txt")
+    if os.path.exists(local):
+        return local
+    return None
+
+
+def _ydl_download(url, dl_dir, allowed_extractors, error_label="video", use_cookies=False):
     """Generic yt-dlp download. Returns list of filenames."""
     files = []
     temp_prefix = uuid.uuid4().hex[:8]
@@ -473,6 +484,11 @@ def _ydl_download(url, dl_dir, allowed_extractors, error_label="video"):
         "retries": 2,
         "allowed_extractors": allowed_extractors,
     }
+
+    if use_cookies:
+        cookie_file = _find_youtube_cookies()
+        if cookie_file:
+            ydl_opts["cookiefile"] = cookie_file
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -497,7 +513,7 @@ def download_twitter_video(tweet_url, dl_dir):
 
 def download_youtube_video(video_url, dl_dir):
     """Download video from YouTube using yt-dlp."""
-    return _ydl_download(video_url, dl_dir, ["youtube", "youtube:tab"], "video")
+    return _ydl_download(video_url, dl_dir, ["youtube", "youtube:tab"], "video", use_cookies=True)
 
 
 # ──────────────────────────────────────────────

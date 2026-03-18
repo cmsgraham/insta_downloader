@@ -1,5 +1,7 @@
 # Sensitive files
 cookies.txt
+youtube_cookies.txt
+*_cookies.txt
 sessions/
 
 # Downloads
