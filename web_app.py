@@ -75,7 +75,11 @@ def _load_cookies_file():
 
 _load_cookies_file()
 
-# Per-visitor state: uid -> { jobs, download_dir }
+# Per-visitor rate limiting
+VISITOR_MAX_DOWNLOADS_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "10"))
+VISITOR_MAX_CONCURRENT = 3
+
+# Per-visitor state: uid -> { jobs, download_dir, request_times }
 _visitors = {}
 _visitors_lock = threading.Lock()
 
@@ -91,8 +95,24 @@ def _get_visitor():
             _visitors[uid] = {
                 "jobs": {},
                 "download_dir": visitor_dir,
+                "request_times": [],
             }
         return _visitors[uid]
+
+
+def _check_visitor_rate_limit(visitor):
+    """Returns error message if rate-limited, None if OK."""
+    now = time.time()
+    # Clean old timestamps
+    visitor["request_times"] = [t for t in visitor["request_times"] if now - t < 60]
+    # Check per-minute limit
+    if len(visitor["request_times"]) >= VISITOR_MAX_DOWNLOADS_PER_MIN:
+        return f"Too many requests. Max {VISITOR_MAX_DOWNLOADS_PER_MIN} downloads per minute."
+    # Check concurrent jobs
+    active = sum(1 for j in visitor["jobs"].values() if j["status"] == "working")
+    if active >= VISITOR_MAX_CONCURRENT:
+        return f"Too many downloads in progress. Wait for current ones to finish."
+    return None
 
 
 # ──────────────────────────────────────────────
@@ -502,10 +522,15 @@ def index():
 @app.route("/api/download", methods=["POST"])
 def api_download():
     visitor = _get_visitor()
+    # Per-visitor rate limit
+    err = _check_visitor_rate_limit(visitor)
+    if err:
+        return jsonify({"error": err}), 429
     data = request.get_json(force=True)
     url = data.get("url", "").strip()
     if not url:
         return jsonify({"error": "URL is required"}), 400
+    visitor["request_times"].append(time.time())
     job_id = uuid.uuid4().hex[:12]
     visitor["jobs"][job_id] = {"status": "working", "message": "Downloading...", "files": []}
     thread = threading.Thread(target=run_download, args=(job_id, url, visitor), daemon=True)
