@@ -1,7 +1,7 @@
 """
-Instagram Downloader — Web Interface
-Uses Instagram's web API (v1) directly to fetch media info and download videos.
-No third-party Instagram libraries needed for downloading.
+Instagram Downloader — Multi-User Web Service
+Each visitor imports their own Instagram session cookies.
+Downloads are isolated per user and auto-expire.
 """
 
 import os
@@ -9,50 +9,46 @@ import re
 import json
 import string
 import time
+import secrets
 import requests
 import threading
 import uuid
 from pathlib import Path
 
-from flask import Flask, render_template_string, request, jsonify, send_from_directory
+from flask import Flask, render_template_string, request, jsonify, session, send_from_directory
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# In-memory job tracker: job_id -> {status, message, files}
-jobs = {}
+FILE_TTL = int(os.environ.get("FILE_TTL_SECONDS", "3600"))  # 1 hour default
 
-# Session state
-session_cookie = None   # raw sessionid string
-session_extras = {}     # csrftoken, ds_user_id, mid
-
-# Rate-limit cooldown: track when we last got a 429 so we don't keep hammering
-_rate_limit_until = 0   # epoch timestamp — skip requests until this time
-
-COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+# Per-user state: uid -> { ig_sessionid, ig_cookies, rate_limit_until, jobs, download_dir }
+_users = {}
+_users_lock = threading.Lock()
 
 
-def _load_cookies_file():
-    """Load session from Netscape cookies.txt if it exists."""
-    global session_cookie, session_extras
-    if not os.path.exists(COOKIES_FILE):
-        return False
-    cookies = {}
-    with open(COOKIES_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 7:
-                cookies[parts[5]] = parts[6]
-    if "sessionid" in cookies:
-        session_cookie = cookies.pop("sessionid")
-        session_extras = {k: v for k, v in cookies.items()}
-        return True
-    return False
+def _get_user():
+    """Get or create per-user state from the Flask session."""
+    if "uid" not in session:
+        session["uid"] = uuid.uuid4().hex
+    uid = session["uid"]
+    with _users_lock:
+        if uid not in _users:
+            user_dir = os.path.join(DOWNLOAD_DIR, uid)
+            os.makedirs(user_dir, exist_ok=True)
+            _users[uid] = {
+                "ig_sessionid": None,
+                "ig_cookies": {},
+                "rate_limit_until": 0,
+                "jobs": {},
+                "download_dir": user_dir,
+            }
+        return _users[uid]
 
 
 # ──────────────────────────────────────────────
@@ -68,13 +64,13 @@ BASE_HEADERS = {
 }
 
 
-def _make_session():
-    """Build a requests.Session with the stored Instagram cookies."""
+def _make_session(user):
+    """Build a requests.Session with the user's Instagram cookies."""
     s = requests.Session()
     s.headers.update(BASE_HEADERS)
-    if session_cookie:
-        s.cookies.set("sessionid", session_cookie, domain=".instagram.com")
-    for k, v in session_extras.items():
+    if user["ig_sessionid"]:
+        s.cookies.set("sessionid", user["ig_sessionid"], domain=".instagram.com")
+    for k, v in user["ig_cookies"].items():
         if v:
             s.cookies.set(k, v, domain=".instagram.com")
     return s
@@ -111,33 +107,31 @@ def parse_url(url):
     return (None, None)
 
 
-def _check_rate_limit():
-    """Raise immediately if we're still in a cooldown window."""
-    global _rate_limit_until
-    remaining = _rate_limit_until - time.time()
+def _check_rate_limit(user):
+    """Raise immediately if this user is still in a cooldown window."""
+    remaining = user["rate_limit_until"] - time.time()
     if remaining > 0:
         raise ConnectionAbortedError(
             f"Instagram rate-limited. Cooling down — try again in {int(remaining)+1}s."
         )
 
 
-def _record_rate_limit(retry_after=None):
-    """Record a 429 and set a cooldown window."""
-    global _rate_limit_until
+def _record_rate_limit(user, retry_after=None):
+    """Record a 429 and set a per-user cooldown window."""
     cooldown = int(retry_after) if retry_after else 60
-    _rate_limit_until = time.time() + cooldown
+    user["rate_limit_until"] = time.time() + cooldown
 
 
-def _fetch_media_v1(media_id):
+def _fetch_media_v1(media_id, user):
     """Fetch media info from the v1 API. Returns parsed JSON or raises."""
-    _check_rate_limit()
-    s = _make_session()
+    _check_rate_limit(user)
+    s = _make_session(user)
     r = s.get(
         f"https://www.instagram.com/api/v1/media/{media_id}/info/",
         timeout=20,
     )
     if r.status_code == 429:
-        _record_rate_limit(r.headers.get("Retry-After"))
+        _record_rate_limit(user, r.headers.get("Retry-After"))
         raise ConnectionAbortedError("v1 API rate-limited (429)")
     if r.status_code != 200:
         raise RuntimeError(f"v1 API returned status {r.status_code}")
@@ -151,14 +145,13 @@ def _fetch_media_v1(media_id):
     return r.json()
 
 
-def _fetch_media_graphql(shortcode):
+def _fetch_media_graphql(shortcode, user):
     """Fallback: fetch media via GraphQL using fb_dtsg token from page HTML."""
-    _check_rate_limit()
-    s = _make_session()
-    # Load the reel/post page to get fb_dtsg
+    _check_rate_limit(user)
+    s = _make_session(user)
     page = s.get(f"https://www.instagram.com/p/{shortcode}/", timeout=20)
     if page.status_code == 429:
-        _record_rate_limit(page.headers.get("Retry-After"))
+        _record_rate_limit(user, page.headers.get("Retry-After"))
         raise ConnectionAbortedError("GraphQL page load rate-limited (429)")
     if page.status_code != 200:
         raise RuntimeError(f"Could not load post page (status {page.status_code})")
@@ -182,7 +175,7 @@ def _fetch_media_graphql(shortcode):
         timeout=20,
     )
     if r.status_code == 429:
-        _record_rate_limit(r.headers.get("Retry-After"))
+        _record_rate_limit(user, r.headers.get("Retry-After"))
         raise ConnectionAbortedError("GraphQL rate-limited (429)")
     if r.status_code != 200 or not r.text:
         raise RuntimeError(f"GraphQL returned status {r.status_code}")
@@ -221,34 +214,31 @@ def _fetch_media_graphql(shortcode):
     return {"items": [item]}
 
 
-def fetch_media_info(media_id, shortcode=None):
+def fetch_media_info(media_id, user, shortcode=None):
     """Fetch media info, trying v1 API first then GraphQL fallback."""
     v1_err = None
     gql_err = None
 
-    # Try v1 API with exponential backoff (3 attempts: 0s, 5s, 15s)
     delays = [0, 5, 15]
     for attempt, delay in enumerate(delays):
         if delay:
             time.sleep(delay)
         try:
-            return _fetch_media_v1(media_id)
+            return _fetch_media_v1(media_id, user)
         except ConnectionAbortedError as e:
             v1_err = e
-            continue  # retry with longer wait
+            continue
         except RuntimeError as e:
             v1_err = e
-            break  # non-429 error, try GraphQL
+            break
 
-    # Fallback to GraphQL if we have a shortcode
     if shortcode:
         try:
-            return _fetch_media_graphql(shortcode)
+            return _fetch_media_graphql(shortcode, user)
         except Exception as e:
             gql_err = e
 
-    # Build a helpful error message
-    remaining = _rate_limit_until - time.time()
+    remaining = user["rate_limit_until"] - time.time()
     if remaining > 0:
         raise ConnectionAbortedError(
             f"Instagram rate-limited. Try again in ~{int(remaining)+1} seconds."
@@ -262,9 +252,9 @@ def fetch_media_info(media_id, shortcode=None):
     raise RuntimeError(" ".join(parts))
 
 
-def _fetch_user_id_v1(username):
+def _fetch_user_id_v1(username, user):
     """Resolve username via v1 web_profile_info API."""
-    s = _make_session()
+    s = _make_session(user)
     r = s.get(
         f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
         timeout=20,
@@ -280,9 +270,9 @@ def _fetch_user_id_v1(username):
     return data["data"]["user"]["id"]
 
 
-def _fetch_user_id_search(username):
+def _fetch_user_id_search(username, user):
     """Resolve username via the search API (fallback when v1 is rate-limited)."""
-    s = _make_session()
+    s = _make_session(user)
     r = s.get(
         "https://www.instagram.com/web/search/topsearch/",
         params={"query": username},
@@ -294,31 +284,29 @@ def _fetch_user_id_search(username):
         raise RuntimeError(f"Search API returned status {r.status_code}")
     data = r.json()
     for entry in data.get("users", []):
-        user = entry.get("user", {})
-        if user.get("username", "").lower() == username.lower():
-            return str(user["pk"])
+        u = entry.get("user", {})
+        if u.get("username", "").lower() == username.lower():
+            return str(u["pk"])
     raise RuntimeError(f"User '{username}' not found in search results.")
 
 
-def fetch_user_id(username):
+def fetch_user_id(username, user):
     """Resolve a username to a numeric user ID, trying v1 API then search fallback."""
-    # Try v1 API first
     try:
-        uid = _fetch_user_id_v1(username)
-        print(f"[+] Resolved @{username} via v1 API → {uid}")
+        uid = _fetch_user_id_v1(username, user)
+        print(f"[+] Resolved @{username} via v1 API -> {uid}")
         return uid
     except ConnectionAbortedError as e:
         print(f"[!] v1 user lookup failed: {e} — trying search fallback")
     except RuntimeError as e:
         print(f"[!] v1 user lookup failed: {e} — trying search fallback")
 
-    # Fallback to search API
     try:
-        uid = _fetch_user_id_search(username)
-        print(f"[+] Resolved @{username} via search API → {uid}")
+        uid = _fetch_user_id_search(username, user)
+        print(f"[+] Resolved @{username} via search API -> {uid}")
         return uid
     except ConnectionAbortedError:
-        _record_rate_limit()
+        _record_rate_limit(user)
         raise ConnectionAbortedError(
             "Instagram rate-limited on all endpoints. Try again in ~60 seconds."
         )
@@ -326,35 +314,35 @@ def fetch_user_id(username):
         raise RuntimeError(f"Could not resolve user '{username}': {e}")
 
 
-def fetch_stories(user_id):
+def fetch_stories(ig_user_id, user):
     """Fetch current stories for a user. Returns list of story items."""
-    s = _make_session()
+    s = _make_session(user)
     r = s.get(
-        f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}",
+        f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={ig_user_id}",
         timeout=20,
     )
     if r.status_code == 429:
-        _record_rate_limit(r.headers.get("Retry-After"))
+        _record_rate_limit(user, r.headers.get("Retry-After"))
         raise ConnectionAbortedError(
-            f"Instagram rate-limited. Try again in ~60 seconds."
+            "Instagram rate-limited. Try again in ~60 seconds."
         )
     if r.status_code != 200:
         raise RuntimeError(f"Could not fetch stories (status {r.status_code})")
     data = r.json()
     reels = data.get("reels", {}) or data.get("reels_media", [])
     if isinstance(reels, dict):
-        reel = reels.get(str(user_id), {})
+        reel = reels.get(str(ig_user_id), {})
         return reel.get("items", [])
     elif isinstance(reels, list):
         for reel in reels:
-            if str(reel.get("id", "")) == str(user_id):
+            if str(reel.get("id", "")) == str(ig_user_id):
                 return reel.get("items", [])
     return []
 
 
-def download_file(url, filepath):
+def download_file(url, filepath, user):
     """Download a URL to a local file."""
-    s = _make_session()
+    s = _make_session(user)
     r = s.get(url, timeout=60, stream=True)
     r.raise_for_status()
     with open(filepath, "wb") as f:
@@ -370,71 +358,70 @@ def pick_best_video(video_versions):
     return max(video_versions, key=lambda v: v.get("width", 0) * v.get("height", 0))
 
 
-def download_media_item(item, prefix=""):
-    """Download a single media item (post, reel, or story item). Returns list of filenames."""
+def download_media_item(item, user, prefix=""):
+    """Download a single media item (post, reel, or carousel). Returns list of filenames."""
     files = []
     media_type = item.get("media_type")
     code = item.get("code", prefix or "unknown")
+    dl_dir = user["download_dir"]
 
     if media_type == 2 and "video_versions" in item:
-        # Video
         best = pick_best_video(item["video_versions"])
         if best:
             fname = f"{code}.mp4"
-            fpath = os.path.join(DOWNLOAD_DIR, fname)
-            download_file(best["url"], fpath)
+            fpath = os.path.join(dl_dir, fname)
+            download_file(best["url"], fpath, user)
             files.append(fname)
     elif media_type == 8 and "carousel_media" in item:
-        # Carousel — download each item
         for i, sub in enumerate(item["carousel_media"]):
             sub_code = f"{code}_slide{i+1}"
             if sub.get("media_type") == 2 and "video_versions" in sub:
                 best = pick_best_video(sub["video_versions"])
                 if best:
                     fname = f"{sub_code}.mp4"
-                    fpath = os.path.join(DOWNLOAD_DIR, fname)
-                    download_file(best["url"], fpath)
+                    fpath = os.path.join(dl_dir, fname)
+                    download_file(best["url"], fpath, user)
                     files.append(fname)
             elif "image_versions2" in sub:
                 candidates = sub["image_versions2"].get("candidates", [])
                 if candidates:
                     best_img = max(candidates, key=lambda c: c.get("width", 0) * c.get("height", 0))
                     fname = f"{sub_code}.jpg"
-                    fpath = os.path.join(DOWNLOAD_DIR, fname)
-                    download_file(best_img["url"], fpath)
+                    fpath = os.path.join(dl_dir, fname)
+                    download_file(best_img["url"], fpath, user)
                     files.append(fname)
     elif media_type == 1 and "image_versions2" in item:
-        # Image post
         candidates = item["image_versions2"].get("candidates", [])
         if candidates:
             best_img = max(candidates, key=lambda c: c.get("width", 0) * c.get("height", 0))
             fname = f"{code}.jpg"
-            fpath = os.path.join(DOWNLOAD_DIR, fname)
-            download_file(best_img["url"], fpath)
+            fpath = os.path.join(dl_dir, fname)
+            download_file(best_img["url"], fpath, user)
             files.append(fname)
 
     return files
 
 
-def download_story_item(item, username="story"):
+def download_story_item(item, user, username="story"):
     """Download a single story item. Returns list of filenames."""
     files = []
     story_id = item.get("pk", item.get("id", "unknown"))
+    dl_dir = user["download_dir"]
 
     if item.get("media_type") == 2 and "video_versions" in item:
         best = pick_best_video(item["video_versions"])
         if best:
             fname = f"{username}_story_{story_id}.mp4"
-            fpath = os.path.join(DOWNLOAD_DIR, fname)
-            download_file(best["url"], fpath)
+            fpath = os.path.join(dl_dir, fname)
+            download_file(best["url"], fpath, user)
             files.append(fname)
     elif "image_versions2" in item:
         candidates = item["image_versions2"].get("candidates", [])
         if candidates:
             best_img = max(candidates, key=lambda c: c.get("width", 0) * c.get("height", 0))
             fname = f"{username}_story_{story_id}.jpg"
-            fpath = os.path.join(DOWNLOAD_DIR, fname)
-            download_file(best_img["url"], fpath)
+            fpath = os.path.join(dl_dir, fname)
+            download_file(best_img["url"], fpath, user)
             files.append(fname)
 
     return files
@@ -444,19 +431,19 @@ def download_story_item(item, username="story"):
 #  Background download worker
 # ──────────────────────────────────────────────
 
-def run_download(job_id, url):
+def run_download(job_id, url, user):
     """Background worker that performs the download."""
     try:
         content_type, identifier = parse_url(url)
         if content_type is None:
-            jobs[job_id] = {"status": "error", "message": f"Could not parse URL: {url}", "files": []}
+            user["jobs"][job_id] = {"status": "error", "message": f"Could not parse URL: {url}", "files": []}
             return
 
-        if not session_cookie:
-            jobs[job_id] = {
+        if not user["ig_sessionid"]:
+            user["jobs"][job_id] = {
                 "status": "error",
-                "message": "Instagram now requires login for all content (posts, reels, and stories). "
-                            "Please import your session cookies first using the 'Import Session' button above.",
+                "message": "Instagram requires login for all content. "
+                           "Please import your session cookies first using the 'Import Session' button above.",
                 "files": [],
             }
             return
@@ -466,52 +453,77 @@ def run_download(job_id, url):
         if content_type == "post":
             shortcode = identifier
             media_id = shortcode_to_media_id(shortcode)
-            data = fetch_media_info(media_id, shortcode=shortcode)
+            data = fetch_media_info(media_id, user, shortcode=shortcode)
 
             if not data.get("items"):
-                jobs[job_id] = {"status": "error", "message": "Media not found or unavailable.", "files": []}
+                user["jobs"][job_id] = {"status": "error", "message": "Media not found or unavailable.", "files": []}
                 return
 
             item = data["items"][0]
-            all_files = download_media_item(item, prefix=shortcode)
+            all_files = download_media_item(item, user, prefix=shortcode)
 
         elif content_type == "story":
             username, story_pk = identifier
-            user_id = fetch_user_id(username)
-            items = fetch_stories(user_id)
+            ig_user_id = fetch_user_id(username, user)
+            items = fetch_stories(ig_user_id, user)
 
             found = False
             for item in items:
                 if str(item.get("pk")) == story_pk or str(item.get("id")) == story_pk:
-                    all_files = download_story_item(item, username)
+                    all_files = download_story_item(item, user, username)
                     found = True
                     break
 
             if not found:
-                jobs[job_id] = {"status": "error", "message": f"Story {story_pk} not found. It may have expired.", "files": []}
+                user["jobs"][job_id] = {"status": "error", "message": f"Story {story_pk} not found. It may have expired.", "files": []}
                 return
 
         elif content_type == "profile_stories":
             username = identifier
-            user_id = fetch_user_id(username)
-            items = fetch_stories(user_id)
+            ig_user_id = fetch_user_id(username, user)
+            items = fetch_stories(ig_user_id, user)
 
             if not items:
-                jobs[job_id] = {"status": "error", "message": f"No active stories found for @{username}.", "files": []}
+                user["jobs"][job_id] = {"status": "error", "message": f"No active stories found for @{username}.", "files": []}
                 return
 
             for item in items:
-                all_files.extend(download_story_item(item, username))
+                all_files.extend(download_story_item(item, user, username))
 
         if all_files:
-            jobs[job_id] = {"status": "done", "message": f"Downloaded {len(all_files)} file(s).", "files": all_files}
+            user["jobs"][job_id] = {"status": "done", "message": f"Downloaded {len(all_files)} file(s).", "files": all_files}
         else:
-            jobs[job_id] = {"status": "done", "message": "No downloadable media found.", "files": []}
+            user["jobs"][job_id] = {"status": "done", "message": "No downloadable media found.", "files": []}
 
     except ConnectionAbortedError as e:
-        jobs[job_id] = {"status": "error", "message": str(e), "files": []}
+        user["jobs"][job_id] = {"status": "error", "message": str(e), "files": []}
     except Exception as e:
-        jobs[job_id] = {"status": "error", "message": str(e), "files": []}
+        user["jobs"][job_id] = {"status": "error", "message": str(e), "files": []}
+
+
+# ──────────────────────────────────────────────
+#  Periodic cleanup of expired downloads
+# ──────────────────────────────────────────────
+
+def _cleanup_loop():
+    """Remove downloaded files older than FILE_TTL and prune empty user dirs."""
+    while True:
+        time.sleep(300)  # check every 5 minutes
+        try:
+            now = time.time()
+            for uid_dir in Path(DOWNLOAD_DIR).iterdir():
+                if not uid_dir.is_dir():
+                    continue
+                for f in uid_dir.iterdir():
+                    if f.is_file() and (now - f.stat().st_mtime) > FILE_TTL:
+                        f.unlink(missing_ok=True)
+                # Remove dir if empty
+                if uid_dir.is_dir() and not any(uid_dir.iterdir()):
+                    uid_dir.rmdir()
+        except Exception:
+            pass
+
+threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
 # ──────────────────────────────────────────────
@@ -520,11 +532,13 @@ def run_download(job_id, url):
 
 @app.route("/")
 def index():
+    _get_user()  # ensure session cookie is set
     return render_template_string(HTML_TEMPLATE)
 
 
 @app.route("/api/download", methods=["POST"])
 def api_download():
+    user = _get_user()
     data = request.get_json(force=True)
     url = data.get("url", "").strip()
 
@@ -532,9 +546,9 @@ def api_download():
         return jsonify({"error": "URL is required"}), 400
 
     job_id = uuid.uuid4().hex[:12]
-    jobs[job_id] = {"status": "working", "message": "Downloading...", "files": []}
+    user["jobs"][job_id] = {"status": "working", "message": "Downloading...", "files": []}
 
-    thread = threading.Thread(target=run_download, args=(job_id, url), daemon=True)
+    thread = threading.Thread(target=run_download, args=(job_id, url, user), daemon=True)
     thread.start()
 
     return jsonify({"job_id": job_id})
@@ -542,7 +556,8 @@ def api_download():
 
 @app.route("/api/status/<job_id>")
 def api_status(job_id):
-    job = jobs.get(job_id)
+    user = _get_user()
+    job = user["jobs"].get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
     return jsonify(job)
@@ -550,8 +565,8 @@ def api_status(job_id):
 
 @app.route("/api/import-session", methods=["POST"])
 def api_import_session():
-    """Import a session from browser cookies."""
-    global session_cookie, session_extras
+    """Import a session from browser cookies — stored per-user."""
+    user = _get_user()
     data = request.get_json(force=True)
     sessionid = data.get("sessionid", "").strip()
     csrftoken = data.get("csrftoken", "").strip()
@@ -562,29 +577,31 @@ def api_import_session():
     if len(sessionid) < 10:
         return jsonify({"error": "sessionid looks too short - double-check the value"}), 400
 
-    session_cookie = sessionid
-    session_extras = {}
+    user["ig_sessionid"] = sessionid
+    user["ig_cookies"] = {}
     if csrftoken:
-        session_extras["csrftoken"] = csrftoken
+        user["ig_cookies"]["csrftoken"] = csrftoken
     if ds_user_id:
-        session_extras["ds_user_id"] = ds_user_id
+        user["ig_cookies"]["ds_user_id"] = ds_user_id
 
     return jsonify({"ok": True, "message": "Session imported successfully! You're now logged in."})
 
 
 @app.route("/api/session-status")
 def api_session_status():
-    remaining = max(0, int(_rate_limit_until - time.time()))
+    user = _get_user()
+    remaining = max(0, int(user["rate_limit_until"] - time.time()))
     return jsonify({
-        "logged_in": session_cookie is not None,
-        "user": session_extras.get("ds_user_id", "imported") if session_cookie else None,
+        "logged_in": user["ig_sessionid"] is not None,
+        "user": user["ig_cookies"].get("ds_user_id", "imported") if user["ig_sessionid"] else None,
         "cooldown": remaining,
     })
 
 
 @app.route("/downloads/<path:filename>")
 def serve_file(filename):
-    return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
+    user = _get_user()
+    return send_from_directory(user["download_dir"], filename, as_attachment=True)
 
 
 # ──────────────────────────────────────────────
@@ -696,7 +713,7 @@ HTML_TEMPLATE = r"""
     </div>
 
     <div id="sessionBar" class="session-bar logged-out">
-        <span><span class="dot orange" id="statusDot"></span> <span id="sessionText">Not logged in — session required for all downloads</span></span>
+        <span><span class="dot orange" id="statusDot"></span> <span id="sessionText">Not logged in — import your session to start</span></span>
         <button class="toggle-btn" onclick="toggleImport()" id="importToggleBtn">Import Session</button>
     </div>
 
@@ -737,7 +754,7 @@ HTML_TEMPLATE = r"""
         <div class="status" id="status"></div>
     </div>
 
-    <div class="footer-hint">Supports: posts, reels, stories &bull; Files saved to <code>downloads/</code></div>
+    <div class="footer-hint">Supports: posts, reels, stories &bull; Your session &amp; files stay private &bull; Downloads auto-expire</div>
 </div>
 
 <script>
@@ -758,7 +775,7 @@ async function checkSession() {
         } else {
             bar.className = 'session-bar logged-out';
             dot.className = 'dot orange';
-            text.textContent = 'Not logged in \u2014 session required for all downloads';
+            text.textContent = 'Not logged in \u2014 import your session to start';
             btn.textContent = 'Import Session';
             document.getElementById('importCard').classList.add('open');
         }
@@ -838,7 +855,6 @@ function showCooldown(msg) {
     const statusEl = document.getElementById('status');
     const btn = document.getElementById('downloadBtn');
     statusEl.className = 'status show error';
-    // Extract seconds from message like "try again in ~60 seconds" or "try again in 45s"
     const match = msg.match(/(\d+)\s*s/i);
     let secs = match ? parseInt(match[1]) : 60;
     const tick = () => {
@@ -864,13 +880,11 @@ document.getElementById('sessionid').addEventListener('keydown', e => { if (e.ke
 
 
 if __name__ == "__main__":
-    # Auto-load cookies on startup
-    if _load_cookies_file():
-        print(f"[+] Loaded session from cookies.txt (user {session_extras.get('ds_user_id', '?')})")
-    else:
-        print("[!] No cookies.txt found — import session via the web UI")
+    import socket
+    local_ip = socket.gethostbyname(socket.gethostname())
     print("=" * 45)
     print("  Instagram Downloader - Web Interface")
-    print("  Open http://localhost:5000 in your browser")
+    print(f"  Local:   http://localhost:5000")
+    print(f"  Network: http://{local_ip}:5000")
     print("=" * 45)
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=False)

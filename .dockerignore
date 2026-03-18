@@ -1,0 +1,11 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+cookies.txt
+downloads/
+sessions/
+web_app_v1.py
+requirements_old.txt
+.git/
+*.md
