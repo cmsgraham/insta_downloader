@@ -32,6 +32,34 @@ FILE_TTL = int(os.environ.get("FILE_TTL_SECONDS", "3600"))  # 1 hour default
 _users = {}
 _users_lock = threading.Lock()
 
+# Device pairing: code -> {"uid": str, "expires": float}
+_pair_codes = {}
+_pair_lock = threading.Lock()
+
+
+def _parse_cookie_input(raw):
+    """Smart-parse user input to extract Instagram cookies.
+    Accepts: raw Cookie header, cURL command, or plain sessionid value."""
+    raw = raw.strip()
+    cookies = {}
+    # Extract Cookie header from a cURL command
+    curl_match = re.search(r"-H\s+['\"]Cookie:\s*([^'\"]+)['\"]", raw, re.IGNORECASE)
+    if curl_match:
+        raw = curl_match.group(1)
+    # Parse key=value pairs separated by semicolons
+    if "=" in raw:
+        for part in raw.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k and v:
+                    cookies[k] = v
+    # If nothing parsed, treat entire input as a plain sessionid value
+    if not cookies and len(raw) > 10 and ";" not in raw and "=" not in raw and " " not in raw:
+        cookies["sessionid"] = raw
+    return cookies
+
 
 def _get_user():
     """Get or create per-user state from the Flask session."""
@@ -507,7 +535,7 @@ def run_download(job_id, url, user):
 # ──────────────────────────────────────────────
 
 def _cleanup_loop():
-    """Remove downloaded files older than FILE_TTL and prune empty user dirs."""
+    """Remove downloaded files older than FILE_TTL, prune empty user dirs, and expire pair codes."""
     while True:
         time.sleep(300)  # check every 5 minutes
         try:
@@ -521,6 +549,11 @@ def _cleanup_loop():
                 # Remove dir if empty
                 if uid_dir.is_dir() and not any(uid_dir.iterdir()):
                     uid_dir.rmdir()
+            # Prune expired pair codes
+            with _pair_lock:
+                expired = [c for c, v in _pair_codes.items() if now > v["expires"]]
+                for c in expired:
+                    del _pair_codes[c]
         except Exception:
             pass
 
@@ -566,26 +599,26 @@ def api_status(job_id):
 
 @app.route("/api/import-session", methods=["POST"])
 def api_import_session():
-    """Import a session from browser cookies — stored per-user."""
+    """Import a session — accepts raw cookie string, cURL, or plain sessionid."""
     user = _get_user()
     data = request.get_json(force=True)
-    sessionid = data.get("sessionid", "").strip()
-    csrftoken = data.get("csrftoken", "").strip()
-    ds_user_id = data.get("ds_user_id", "").strip()
+    raw = data.get("raw", "").strip()
+
+    if not raw:
+        return jsonify({"error": "Please paste your cookie string."}), 400
+
+    cookies = _parse_cookie_input(raw)
+    sessionid = cookies.get("sessionid", "")
 
     if not sessionid:
-        return jsonify({"error": "sessionid cookie is required"}), 400
+        return jsonify({"error": "No sessionid found. Make sure you copied the full Cookie header."}), 400
     if len(sessionid) < 10:
-        return jsonify({"error": "sessionid looks too short - double-check the value"}), 400
+        return jsonify({"error": "sessionid looks too short — double-check the value."}), 400
 
     user["ig_sessionid"] = sessionid
-    user["ig_cookies"] = {}
-    if csrftoken:
-        user["ig_cookies"]["csrftoken"] = csrftoken
-    if ds_user_id:
-        user["ig_cookies"]["ds_user_id"] = ds_user_id
+    user["ig_cookies"] = {k: v for k, v in cookies.items() if k != "sessionid"}
 
-    return jsonify({"ok": True, "message": "Session imported successfully! You're now logged in."})
+    return jsonify({"ok": True, "message": "Connected! You can now download content."})
 
 
 @app.route("/api/session-status")
@@ -597,6 +630,46 @@ def api_session_status():
         "user": user["ig_cookies"].get("ds_user_id", "imported") if user["ig_sessionid"] else None,
         "cooldown": remaining,
     })
+
+
+@app.route("/api/generate-pair-code", methods=["POST"])
+def api_generate_pair_code():
+    """Generate a 6-digit code to pair a mobile device."""
+    user = _get_user()
+    uid = session["uid"]
+    if not user["ig_sessionid"]:
+        return jsonify({"error": "Import your session first."}), 400
+    code = "".join(secrets.choice("0123456789") for _ in range(6))
+    with _pair_lock:
+        # Invalidate any previous codes for this user
+        to_del = [c for c, v in _pair_codes.items() if v["uid"] == uid]
+        for c in to_del:
+            del _pair_codes[c]
+        _pair_codes[code] = {"uid": uid, "expires": time.time() + 300}
+    return jsonify({"code": code, "expires_in": 300})
+
+
+@app.route("/api/pair", methods=["POST"])
+def api_pair():
+    """Pair this device with another session using a 6-digit code."""
+    user = _get_user()
+    data = request.get_json(force=True)
+    code = data.get("code", "").strip()
+    if not code or len(code) != 6 or not code.isdigit():
+        return jsonify({"error": "Enter a valid 6-digit code."}), 400
+    with _pair_lock:
+        entry = _pair_codes.get(code)
+        if not entry or time.time() > entry["expires"]:
+            return jsonify({"error": "Invalid or expired code."}), 400
+        source_uid = entry["uid"]
+        del _pair_codes[code]
+    with _users_lock:
+        source = _users.get(source_uid)
+        if not source or not source["ig_sessionid"]:
+            return jsonify({"error": "Source session is no longer valid."}), 400
+        user["ig_sessionid"] = source["ig_sessionid"]
+        user["ig_cookies"] = dict(source["ig_cookies"])
+    return jsonify({"ok": True, "message": "Device linked! You're now connected."})
 
 
 @app.route("/downloads/<path:filename>")
@@ -614,7 +687,7 @@ HTML_TEMPLATE = r"""
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
 <title>Instagram Downloader</title>
 <style>
     :root {
@@ -635,11 +708,12 @@ HTML_TEMPLATE = r"""
         display: flex;
         align-items: center;
         justify-content: center;
+        padding: 16px;
     }
-    .container { width: 100%; max-width: 560px; padding: 20px; }
+    .container { width: 100%; max-width: 560px; }
     .logo { text-align: center; margin-bottom: 30px; }
     .logo h1 {
-        font-size: 28px;
+        font-size: 26px;
         background: linear-gradient(45deg, var(--accent), var(--accent2));
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
@@ -649,46 +723,72 @@ HTML_TEMPLATE = r"""
         background: var(--card);
         border: 1px solid var(--border);
         border-radius: 16px;
-        padding: 28px;
+        padding: 24px;
         margin-bottom: 16px;
     }
     .session-bar {
-        display: flex; align-items: center; justify-content: space-between;
-        padding: 10px 14px; border-radius: 10px; margin-bottom: 18px; font-size: 13px;
+        display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+        padding: 12px 14px; border-radius: 10px; margin-bottom: 18px; font-size: 13px;
     }
     .session-bar.logged-in { background: #0a2e1a; border: 1px solid #1a5e3a; }
     .session-bar.logged-out { background: #2e1a0a; border: 1px solid #5e3a1a; }
-    .session-bar .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 8px; }
-    .session-bar .dot.green { background: #4caf50; }
-    .session-bar .dot.orange { background: #ff9800; }
-    .field { margin-bottom: 18px; }
-    .field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
-    .field input {
-        width: 100%; padding: 12px 14px; background: var(--bg); border: 1px solid var(--border);
-        border-radius: 10px; color: var(--text); font-size: 15px; outline: none; transition: border-color 0.2s; font-family: inherit;
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+    .dot.green { background: #4caf50; }
+    .dot.orange { background: #ff9800; }
+    .session-actions { display: flex; gap: 10px; }
+    .toggle-btn {
+        background: none; border: none; color: var(--accent); cursor: pointer;
+        font-size: 13px; padding: 4px 0; -webkit-tap-highlight-color: transparent;
     }
-    .field input:focus { border-color: var(--accent); }
-    .field input::placeholder { color: #555; }
-    .field .hint-text { font-size: 11px; color: var(--muted); margin-top: 4px; }
-    .toggle-btn { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 13px; }
     .toggle-btn:hover { text-decoration: underline; }
-    .collapsible { display: none; }
-    .collapsible.open { display: block; }
+    .tabs { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+    .tab {
+        flex: 1; padding: 12px; text-align: center; font-size: 14px; font-weight: 500;
+        background: none; border: none; color: var(--muted); cursor: pointer;
+        border-bottom: 2px solid transparent; transition: all 0.2s;
+        -webkit-tap-highlight-color: transparent;
+    }
+    .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    .field { margin-bottom: 18px; }
+    .field label {
+        display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px;
+        text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    .field input, .field textarea {
+        width: 100%; padding: 14px; background: var(--bg); border: 1px solid var(--border);
+        border-radius: 10px; color: var(--text); font-size: 16px; outline: none;
+        transition: border-color 0.2s; font-family: inherit; resize: vertical;
+    }
+    .field input:focus, .field textarea:focus { border-color: var(--accent); }
+    .field input::placeholder, .field textarea::placeholder { color: #555; }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
     .btn {
-        width: 100%; padding: 14px;
+        width: 100%; padding: 16px;
         background: linear-gradient(45deg, var(--accent), var(--accent2));
         color: #fff; border: none; border-radius: 10px; font-size: 16px; font-weight: 600;
-        cursor: pointer; transition: opacity 0.2s;
+        cursor: pointer; transition: opacity 0.2s; -webkit-tap-highlight-color: transparent;
     }
     .btn:hover { opacity: 0.9; }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .status { margin-top: 20px; padding: 14px; border-radius: 10px; font-size: 14px; display: none; }
+    .btn-outline {
+        width: 100%; padding: 14px; background: transparent;
+        border: 1px solid var(--border); border-radius: 10px;
+        color: var(--text); font-size: 15px; font-weight: 500;
+        cursor: pointer; transition: border-color 0.2s; -webkit-tap-highlight-color: transparent;
+    }
+    .btn-outline:hover { border-color: var(--accent); }
+    .status { margin-top: 16px; padding: 14px; border-radius: 10px; font-size: 14px; display: none; }
     .status.show { display: block; }
     .status.working { background: #1a1a2e; border: 1px solid #333; }
     .status.done { background: #0a2e1a; border: 1px solid #1a5e3a; }
     .status.error { background: #2e0a0a; border: 1px solid #5e1a1a; }
     .file-list { margin-top: 10px; }
-    .file-list a { display: block; color: var(--accent); text-decoration: none; padding: 6px 0; font-size: 14px; }
+    .file-list a {
+        display: block; color: var(--accent); text-decoration: none;
+        padding: 8px 0; font-size: 15px;
+    }
     .file-list a:hover { text-decoration: underline; }
     .spinner {
         display: inline-block; width: 16px; height: 16px;
@@ -697,68 +797,142 @@ HTML_TEMPLATE = r"""
         vertical-align: middle; margin-right: 8px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .steps {
+    .instructions {
         background: #111; border: 1px solid var(--border); border-radius: 10px;
-        padding: 16px; margin: 14px 0; font-size: 13px; line-height: 1.8;
+        padding: 16px; margin-bottom: 18px; font-size: 13px; line-height: 1.7;
     }
-    .steps ol { padding-left: 20px; }
-    .steps code { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 12px; color: var(--accent); }
-    .footer-hint { text-align: center; margin-top: 16px; font-size: 12px; color: var(--muted); }
+    .instructions ol { padding-left: 20px; }
+    .instructions code {
+        background: #222; padding: 2px 6px; border-radius: 4px;
+        font-size: 12px; color: var(--accent);
+    }
+    .pair-code-display { text-align: center; padding: 20px 0; }
+    .pair-code-display .code {
+        font-size: 42px; font-weight: 700; letter-spacing: 12px;
+        font-family: 'SF Mono', 'Consolas', monospace;
+        background: linear-gradient(45deg, var(--accent), var(--accent2));
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        margin: 16px 0;
+    }
+    .pair-code-display .expires { color: var(--muted); font-size: 13px; }
+    .code-input {
+        text-align: center; font-size: 28px; letter-spacing: 10px; font-weight: 600;
+        font-family: 'SF Mono', 'Consolas', monospace;
+    }
+    .collapsible { display: none; }
+    .collapsible.open { display: block; }
+    .footer-hint {
+        text-align: center; margin-top: 16px; font-size: 12px;
+        color: var(--muted); line-height: 1.6;
+    }
 </style>
 </head>
 <body>
 <div class="container">
     <div class="logo">
         <h1>Instagram Downloader</h1>
-        <p>Paste a link to download reels, posts, or stories</p>
+        <p>Download reels, posts &amp; stories &mdash; free &amp; private</p>
     </div>
 
+    <!-- Session status -->
     <div id="sessionBar" class="session-bar logged-out">
-        <span><span class="dot orange" id="statusDot"></span> <span id="sessionText">Not logged in — import your session to start</span></span>
-        <button class="toggle-btn" onclick="toggleImport()" id="importToggleBtn">Import Session</button>
+        <span><span class="dot orange" id="statusDot"></span><span id="sessionText">Not connected</span></span>
+        <div class="session-actions">
+            <button class="toggle-btn" onclick="toggleImport()" id="importToggleBtn">Connect</button>
+            <button class="toggle-btn" onclick="togglePairDisplay()" id="pairDisplayBtn" style="display:none">&#128241; Link Mobile</button>
+        </div>
     </div>
 
+    <!-- Pair code display (desktop &rarr; mobile) -->
+    <div class="card collapsible" id="pairDisplayCard">
+        <div class="pair-code-display">
+            <div style="font-size:14px;color:var(--muted);margin-bottom:4px">Enter this code on your phone</div>
+            <div class="code" id="pairCodeValue">------</div>
+            <div class="expires" id="pairExpiry">Generating...</div>
+        </div>
+        <button class="btn-outline" onclick="generatePairCode()" id="refreshCodeBtn">Generate New Code</button>
+    </div>
+
+    <!-- Import / Pair card -->
     <div class="card collapsible" id="importCard">
-        <div class="steps">
-            <strong>How to get your session cookie:</strong>
-            <ol>
-                <li>Open <a href="https://www.instagram.com" target="_blank" style="color:var(--accent)">instagram.com</a> in your browser and <strong>log in normally</strong></li>
-                <li>Press <code>F12</code> to open DevTools</li>
-                <li>Go to <strong>Application</strong> tab &rarr; <strong>Cookies</strong> &rarr; <code>https://www.instagram.com</code></li>
-                <li>Find and copy the <code>sessionid</code> cookie value</li>
-                <li>Paste it below and click Import</li>
-            </ol>
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('paste')" id="tabPaste">Paste Cookies</button>
+            <button class="tab" onclick="switchTab('code')" id="tabCode">Enter Code</button>
         </div>
-        <div class="field">
-            <label>sessionid <span style="color:var(--accent)">*</span></label>
-            <input type="text" id="sessionid" placeholder="Paste your sessionid cookie here">
+
+        <!-- Tab 1: Paste cookies -->
+        <div class="tab-content active" id="panePaste">
+            <div class="instructions">
+                <strong>How to get your cookies:</strong>
+                <ol>
+                    <li>Open <a href="https://www.instagram.com" target="_blank" style="color:var(--accent)">instagram.com</a> and log in</li>
+                    <li>Press <code>F12</code> &rarr; <strong>Network</strong> tab</li>
+                    <li>Refresh the page, click any request</li>
+                    <li>Find the <code>Cookie</code> header &rarr; copy its full value</li>
+                    <li>Paste it below</li>
+                </ol>
+            </div>
+            <div class="field">
+                <label>Cookie string</label>
+                <textarea id="cookieInput" rows="3" placeholder="sessionid=abc123; csrftoken=xyz; ds_user_id=..."></textarea>
+                <div class="hint">Paste the full Cookie header, a cURL command, or just the sessionid value.</div>
+            </div>
+            <button class="btn" onclick="importSession()" id="importBtn">Connect to Instagram</button>
+            <div class="status" id="importStatus"></div>
         </div>
-        <div class="field">
-            <label>csrftoken <span style="color:var(--muted)">(optional)</span></label>
-            <input type="text" id="csrftoken" placeholder="csrftoken cookie value">
-            <div class="hint-text">Also from the same cookies list. Helps with reliability.</div>
+
+        <!-- Tab 2: Enter pair code -->
+        <div class="tab-content" id="paneCode">
+            <div class="instructions">
+                <strong>Link from another device:</strong>
+                <ol>
+                    <li>On a computer, open this site and import your cookies</li>
+                    <li>Click <strong>&#128241; Link Mobile</strong> to get a 6-digit code</li>
+                    <li>Enter the code below</li>
+                </ol>
+            </div>
+            <div class="field">
+                <label>6-digit code</label>
+                <input type="text" id="pairCodeInput" class="code-input"
+                       inputmode="numeric" pattern="[0-9]*" maxlength="6"
+                       placeholder="000000" autocomplete="off">
+            </div>
+            <button class="btn" onclick="pairDevice()" id="pairBtn">Link Device</button>
+            <div class="status" id="pairStatus"></div>
         </div>
-        <div class="field">
-            <label>ds_user_id <span style="color:var(--muted)">(optional)</span></label>
-            <input type="text" id="ds_user_id" placeholder="ds_user_id cookie value">
-        </div>
-        <button class="btn" onclick="importSession()" id="importBtn">Import Session</button>
-        <div class="status" id="importStatus"></div>
     </div>
 
+    <!-- Download -->
     <div class="card">
         <div class="field">
             <label>Instagram URL</label>
-            <input type="text" id="url" placeholder="https://www.instagram.com/reel/..." autofocus>
+            <input type="url" id="url" placeholder="https://www.instagram.com/reel/..." autofocus>
         </div>
         <button class="btn" id="downloadBtn" onclick="startDownload()">Download</button>
         <div class="status" id="status"></div>
     </div>
 
-    <div class="footer-hint">Supports: posts, reels, stories &bull; Your session &amp; files stay private &bull; Downloads auto-expire</div>
+    <div class="footer-hint">
+        Your cookies are used only to fetch content and are never stored to disk.<br>
+        Downloads auto-expire after 1 hour.
+    </div>
 </div>
 
 <script>
+/* ── Tabs ── */
+function switchTab(tab) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(p => p.classList.remove('active'));
+    if (tab === 'paste') {
+        document.getElementById('tabPaste').classList.add('active');
+        document.getElementById('panePaste').classList.add('active');
+    } else {
+        document.getElementById('tabCode').classList.add('active');
+        document.getElementById('paneCode').classList.add('active');
+    }
+}
+
+/* ── Session check ── */
 async function checkSession() {
     try {
         const resp = await fetch('/api/session-status');
@@ -766,48 +940,127 @@ async function checkSession() {
         const bar = document.getElementById('sessionBar');
         const dot = document.getElementById('statusDot');
         const text = document.getElementById('sessionText');
-        const btn = document.getElementById('importToggleBtn');
+        const importBtn = document.getElementById('importToggleBtn');
+        const pairBtn = document.getElementById('pairDisplayBtn');
         if (data.logged_in) {
             bar.className = 'session-bar logged-in';
             dot.className = 'dot green';
-            text.textContent = 'Logged in';
-            btn.textContent = 'Change Session';
+            text.textContent = 'Connected to Instagram';
+            importBtn.textContent = 'Change';
+            pairBtn.style.display = '';
             document.getElementById('importCard').classList.remove('open');
         } else {
             bar.className = 'session-bar logged-out';
             dot.className = 'dot orange';
-            text.textContent = 'Not logged in \u2014 import your session to start';
-            btn.textContent = 'Import Session';
+            text.textContent = 'Not connected';
+            importBtn.textContent = 'Connect';
+            pairBtn.style.display = 'none';
             document.getElementById('importCard').classList.add('open');
         }
     } catch(e) {}
 }
 checkSession();
 
-function toggleImport() { document.getElementById('importCard').classList.toggle('open'); }
+function toggleImport() {
+    document.getElementById('importCard').classList.toggle('open');
+    document.getElementById('pairDisplayCard').classList.remove('open');
+}
 
+function togglePairDisplay() {
+    const card = document.getElementById('pairDisplayCard');
+    card.classList.toggle('open');
+    document.getElementById('importCard').classList.remove('open');
+    if (card.classList.contains('open')) generatePairCode();
+}
+
+/* ── Import session (smart paste) ── */
 async function importSession() {
-    const sessionid = document.getElementById('sessionid').value.trim();
-    const csrftoken = document.getElementById('csrftoken').value.trim();
-    const ds_user_id = document.getElementById('ds_user_id').value.trim();
+    const raw = document.getElementById('cookieInput').value.trim();
     const statusEl = document.getElementById('importStatus');
     const btn = document.getElementById('importBtn');
-    if (!sessionid) { alert('Please paste your sessionid cookie.'); return; }
-    btn.disabled = true; btn.textContent = 'Importing...';
+    if (!raw) { alert('Please paste your cookie string.'); return; }
+    btn.disabled = true; btn.textContent = 'Connecting...';
     statusEl.className = 'status show working';
     statusEl.innerHTML = '<span class="spinner"></span> Importing session...';
     try {
         const resp = await fetch('/api/import-session', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ sessionid, csrftoken, ds_user_id })
+            body: JSON.stringify({ raw })
         });
         const data = await resp.json();
-        if (data.ok) { statusEl.className = 'status show done'; statusEl.textContent = data.message; checkSession(); }
-        else { statusEl.className = 'status show error'; statusEl.textContent = data.error || 'Import failed'; }
-    } catch(e) { statusEl.className = 'status show error'; statusEl.textContent = 'Request failed: ' + e.message; }
-    btn.disabled = false; btn.textContent = 'Import Session';
+        if (data.ok) {
+            statusEl.className = 'status show done';
+            statusEl.textContent = data.message;
+            checkSession();
+        } else {
+            statusEl.className = 'status show error';
+            statusEl.textContent = data.error || 'Import failed';
+        }
+    } catch(e) {
+        statusEl.className = 'status show error';
+        statusEl.textContent = 'Request failed: ' + e.message;
+    }
+    btn.disabled = false; btn.textContent = 'Connect to Instagram';
 }
 
+/* ── Generate pair code ── */
+let pairCountdown = null;
+async function generatePairCode() {
+    const codeEl = document.getElementById('pairCodeValue');
+    const expiryEl = document.getElementById('pairExpiry');
+    try {
+        const resp = await fetch('/api/generate-pair-code', { method: 'POST' });
+        const data = await resp.json();
+        if (data.error) { expiryEl.textContent = data.error; return; }
+        codeEl.textContent = data.code;
+        if (pairCountdown) clearInterval(pairCountdown);
+        let secs = data.expires_in;
+        const fmt = s => Math.floor(s/60) + ':' + String(s%60).padStart(2,'0');
+        expiryEl.textContent = 'Expires in ' + fmt(secs);
+        pairCountdown = setInterval(() => {
+            secs--;
+            if (secs <= 0) {
+                clearInterval(pairCountdown);
+                codeEl.textContent = '------';
+                expiryEl.textContent = 'Code expired';
+                return;
+            }
+            expiryEl.textContent = 'Expires in ' + fmt(secs);
+        }, 1000);
+    } catch(e) { expiryEl.textContent = 'Failed to generate code'; }
+}
+
+/* ── Pair device ── */
+async function pairDevice() {
+    const code = document.getElementById('pairCodeInput').value.trim();
+    const statusEl = document.getElementById('pairStatus');
+    const btn = document.getElementById('pairBtn');
+    if (!code || code.length !== 6) { alert('Enter the 6-digit code from your other device.'); return; }
+    btn.disabled = true; btn.textContent = 'Linking...';
+    statusEl.className = 'status show working';
+    statusEl.innerHTML = '<span class="spinner"></span> Linking device...';
+    try {
+        const resp = await fetch('/api/pair', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ code })
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            statusEl.className = 'status show done';
+            statusEl.textContent = data.message;
+            checkSession();
+        } else {
+            statusEl.className = 'status show error';
+            statusEl.textContent = data.error || 'Pairing failed';
+        }
+    } catch(e) {
+        statusEl.className = 'status show error';
+        statusEl.textContent = 'Request failed: ' + e.message;
+    }
+    btn.disabled = false; btn.textContent = 'Link Device';
+}
+
+/* ── Download ── */
 async function startDownload() {
     const btn = document.getElementById('downloadBtn');
     const statusEl = document.getElementById('status');
@@ -822,9 +1075,18 @@ async function startDownload() {
             body: JSON.stringify({ url })
         });
         const data = await resp.json();
-        if (data.error) { statusEl.className = 'status show error'; statusEl.textContent = data.error; btn.disabled = false; btn.textContent = 'Download'; return; }
+        if (data.error) {
+            statusEl.className = 'status show error';
+            statusEl.textContent = data.error;
+            btn.disabled = false; btn.textContent = 'Download';
+            return;
+        }
         pollStatus(data.job_id);
-    } catch(e) { statusEl.className = 'status show error'; statusEl.textContent = 'Request failed: ' + e.message; btn.disabled = false; btn.textContent = 'Download'; }
+    } catch(e) {
+        statusEl.className = 'status show error';
+        statusEl.textContent = 'Request failed: ' + e.message;
+        btn.disabled = false; btn.textContent = 'Download';
+    }
 }
 
 function pollStatus(jobId) {
@@ -834,21 +1096,35 @@ function pollStatus(jobId) {
         try {
             const resp = await fetch('/api/status/' + jobId);
             const data = await resp.json();
-            if (data.status === 'working') { statusEl.innerHTML = '<span class="spinner"></span> ' + data.message; return; }
-            clearInterval(interval); btn.disabled = false; btn.textContent = 'Download';
+            if (data.status === 'working') {
+                statusEl.innerHTML = '<span class="spinner"></span> ' + data.message;
+                return;
+            }
+            clearInterval(interval);
+            btn.disabled = false; btn.textContent = 'Download';
             if (data.status === 'done') {
                 statusEl.className = 'status show done';
                 let html = data.message;
                 if (data.files && data.files.length > 0) {
                     html += '<div class="file-list">';
-                    data.files.forEach(f => { html += '<a href="/downloads/' + encodeURIComponent(f) + '">' + f + '</a>'; });
+                    data.files.forEach(f => {
+                        html += '<a href="/downloads/' + encodeURIComponent(f) + '">' + f + '</a>';
+                    });
                     html += '</div>';
                 }
                 statusEl.innerHTML = html;
             } else if (data.message && data.message.toLowerCase().includes('rate-limit')) {
                 showCooldown(data.message);
-            } else { statusEl.className = 'status show error'; statusEl.textContent = data.message; }
-        } catch(e) { clearInterval(interval); statusEl.className = 'status show error'; statusEl.textContent = 'Polling failed: ' + e.message; btn.disabled = false; btn.textContent = 'Download'; }
+            } else {
+                statusEl.className = 'status show error';
+                statusEl.textContent = data.message;
+            }
+        } catch(e) {
+            clearInterval(interval);
+            statusEl.className = 'status show error';
+            statusEl.textContent = 'Polling failed: ' + e.message;
+            btn.disabled = false; btn.textContent = 'Download';
+        }
     }, 1500);
 }
 
@@ -860,20 +1136,27 @@ function showCooldown(msg) {
     let secs = match ? parseInt(match[1]) : 60;
     const tick = () => {
         if (secs <= 0) {
-            statusEl.innerHTML = 'Cooldown over — retrying now...';
+            statusEl.innerHTML = 'Cooldown over \u2014 retrying...';
             statusEl.className = 'status show working';
             startDownload();
             return;
         }
-        statusEl.innerHTML = '\u23f3 Rate-limited by Instagram. Auto-retry in <strong>' + secs + 's</strong>...&nbsp; <button onclick="startDownload()" style="background:none;border:1px solid var(--accent);color:var(--accent);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:13px">Retry Now</button>';
+        statusEl.innerHTML = '\u23f3 Rate-limited. Auto-retry in <strong>' + secs + 's</strong> '
+            + '<button onclick="startDownload()" style="background:none;border:1px solid var(--accent);'
+            + 'color:var(--accent);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:13px">'
+            + 'Retry Now</button>';
         secs--;
         setTimeout(tick, 1000);
     };
     tick();
 }
 
+/* ── Keyboard shortcuts ── */
 document.getElementById('url').addEventListener('keydown', e => { if (e.key === 'Enter') startDownload(); });
-document.getElementById('sessionid').addEventListener('keydown', e => { if (e.key === 'Enter') importSession(); });
+document.getElementById('pairCodeInput').addEventListener('keydown', e => { if (e.key === 'Enter') pairDevice(); });
+document.getElementById('cookieInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); importSession(); }
+});
 </script>
 </body>
 </html>
