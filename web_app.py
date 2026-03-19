@@ -15,8 +15,6 @@ import requests
 import threading
 import uuid
 import hmac
-import shutil
-import tempfile
 from pathlib import Path
 
 import yt_dlp
@@ -459,18 +457,11 @@ def _resolve_short_url(url):
         return url
 
 
-def _find_youtube_cookies():
-    """Locate youtube_cookies.txt file."""
-    path = os.environ.get("YOUTUBE_COOKIES_FILE", "/app/youtube_cookies.txt")
-    if os.path.exists(path):
-        return path
-    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "youtube_cookies.txt")
-    if os.path.exists(local):
-        return local
-    return None
+YOUTUBE_PLAYER_CLIENTS = ["mediaconnect", "ios", "web_creator"]
 
 
-def _ydl_download(url, dl_dir, allowed_extractors, error_label="video", use_cookies=False):
+def _ydl_download(url, dl_dir, allowed_extractors, error_label="video",
+                  extractor_args=None):
     """Generic yt-dlp download. Returns list of filenames."""
     files = []
     temp_prefix = uuid.uuid4().hex[:8]
@@ -487,32 +478,19 @@ def _ydl_download(url, dl_dir, allowed_extractors, error_label="video", use_cook
         "allowed_extractors": allowed_extractors,
     }
 
-    if use_cookies:
-        cookie_file = _find_youtube_cookies()
-        if cookie_file:
-            # Copy to a temp file so yt-dlp doesn't overwrite the original
-            tmp = os.path.join(dl_dir, f".yt_cookies_{temp_prefix}.txt")
-            shutil.copy2(cookie_file, tmp)
-            ydl_opts["cookiefile"] = tmp
+    if extractor_args:
+        ydl_opts["extractor_args"] = extractor_args
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info is None:
-                raise RuntimeError(f"Could not extract {error_label} info from this URL.")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info is None:
+            raise RuntimeError(f"Could not extract {error_label} info from this URL.")
 
-            entries = info.get("entries", [info]) if "entries" in info else [info]
-            for entry in entries:
-                filename = ydl.prepare_filename(entry)
-                if os.path.exists(filename):
-                    files.append(os.path.basename(filename))
-    finally:
-        # Clean up temp cookies copy
-        if use_cookies and "cookiefile" in ydl_opts:
-            try:
-                os.unlink(ydl_opts["cookiefile"])
-            except OSError:
-                pass
+        entries = info.get("entries", [info]) if "entries" in info else [info]
+        for entry in entries:
+            filename = ydl.prepare_filename(entry)
+            if os.path.exists(filename):
+                files.append(os.path.basename(filename))
 
     if not files:
         raise RuntimeError(f"No downloadable {error_label} found.")
@@ -525,8 +503,12 @@ def download_twitter_video(tweet_url, dl_dir):
 
 
 def download_youtube_video(video_url, dl_dir):
-    """Download video from YouTube using yt-dlp."""
-    return _ydl_download(video_url, dl_dir, ["youtube", "youtube:tab"], "video", use_cookies=True)
+    """Download video from YouTube using yt-dlp with alternate player clients."""
+    return _ydl_download(
+        video_url, dl_dir,
+        ["youtube", "youtube:tab"], "video",
+        extractor_args={"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}},
+    )
 
 
 # ──────────────────────────────────────────────

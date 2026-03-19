@@ -10,7 +10,6 @@ services:
     volumes:
       - downloads:/app/downloads
       - ./cookies.txt:/app/cookies.txt:ro
-      - ./youtube_cookies.txt:/app/youtube_cookies.txt:ro
     restart: unless-stopped
 
 volumes:
