@@ -461,7 +461,7 @@ YOUTUBE_PLAYER_CLIENTS = ["mediaconnect", "ios", "web_creator"]
 
 
 def _ydl_download(url, dl_dir, allowed_extractors, error_label="video",
-                  extractor_args=None):
+                  extractor_args=None, cookie_file=None):
     """Generic yt-dlp download. Returns list of filenames."""
     files = []
     temp_prefix = uuid.uuid4().hex[:8]
@@ -480,6 +480,9 @@ def _ydl_download(url, dl_dir, allowed_extractors, error_label="video",
 
     if extractor_args:
         ydl_opts["extractor_args"] = extractor_args
+
+    if cookie_file and os.path.exists(cookie_file):
+        ydl_opts["cookiefile"] = cookie_file
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -502,12 +505,16 @@ def download_twitter_video(tweet_url, dl_dir):
     return _ydl_download(tweet_url, dl_dir, ["twitter", "twitter:card"], "video")
 
 
+YOUTUBE_COOKIES_FILE = os.environ.get("YOUTUBE_COOKIES_FILE", "/app/youtube_cookies.txt")
+
+
 def download_youtube_video(video_url, dl_dir):
     """Download video from YouTube using yt-dlp with alternate player clients."""
     return _ydl_download(
         video_url, dl_dir,
         ["youtube", "youtube:tab"], "video",
         extractor_args={"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}},
+        cookie_file=YOUTUBE_COOKIES_FILE,
     )
 
 
