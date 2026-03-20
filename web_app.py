@@ -527,6 +527,7 @@ def download_youtube_video(video_url, dl_dir):
         extractor_args={
             "youtubepot-bgutilhttp": {"base_url": ["http://bgutil-provider:4416"]},
         },
+        js_runtimes={"node": {}},
     )
 
 
