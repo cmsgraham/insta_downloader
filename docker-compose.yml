@@ -7,14 +7,10 @@ services:
       - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
       - FILE_TTL_SECONDS=3600
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
-      - COOKIE_REFRESH_HOURS=4
     volumes:
       - downloads:/app/downloads
-      - cookie_data:/app/cookie_data
       - ./cookies.txt:/app/cookies.txt:ro
-      - ./www.youtube.com_cookies.txt:/app/youtube_cookies_seed.txt:ro
     restart: unless-stopped
 
 volumes:
   downloads:
-  cookie_data:

@@ -10,7 +10,6 @@ import re
 import json
 import string
 import time
-import logging
 import secrets
 import requests
 import threading
@@ -21,8 +20,6 @@ from pathlib import Path
 
 import yt_dlp
 from flask import Flask, render_template_string, request, jsonify, session, send_from_directory
-
-import cookie_manager
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
@@ -464,14 +461,8 @@ def _resolve_short_url(url):
 YOUTUBE_PLAYER_CLIENTS = ["ios", "web_creator"]
 
 
-# Initialise YouTube cookie management
-cookie_manager.seed_cookies()
-_cookie_daemon = cookie_manager.CookieRefreshDaemon()
-_cookie_daemon.start()
-
-
 def _ydl_download(url, dl_dir, allowed_extractors, error_label="video",
-                  extractor_args=None, cookie_file=None):
+                  extractor_args=None, cookie_file=None, js_runtimes=None):
     """Generic yt-dlp download. Returns list of filenames."""
     files = []
     temp_prefix = uuid.uuid4().hex[:8]
@@ -490,6 +481,9 @@ def _ydl_download(url, dl_dir, allowed_extractors, error_label="video",
 
     if extractor_args:
         ydl_opts["extractor_args"] = extractor_args
+
+    if js_runtimes:
+        ydl_opts["js_runtimes"] = js_runtimes
 
     tmp_cookies = None
     if cookie_file and os.path.exists(cookie_file):
@@ -526,23 +520,12 @@ def download_twitter_video(tweet_url, dl_dir):
 
 
 def download_youtube_video(video_url, dl_dir):
-    """Download video from YouTube, auto-refreshing cookies on bot detection."""
-    try:
-        return _do_youtube_download(video_url, dl_dir)
-    except Exception as exc:
-        if cookie_manager.is_bot_detection_error(exc):
-            logging.getLogger(__name__).info("Bot detection hit, refreshing cookies and retrying...")
-            cookie_manager.refresh_cookies()
-            return _do_youtube_download(video_url, dl_dir)
-        raise
-
-
-def _do_youtube_download(video_url, dl_dir):
+    """Download video from YouTube using PO token provider + player clients."""
     return _ydl_download(
         video_url, dl_dir,
         ["youtube", "youtube:tab"], "video",
         extractor_args={"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}},
-        cookie_file=cookie_manager.COOKIE_FILE,
+        js_runtimes={"node": {}},
     )
 
 
