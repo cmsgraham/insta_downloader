@@ -10,6 +10,13 @@ services:
     volumes:
       - downloads:/app/downloads
       - ./cookies.txt:/app/cookies.txt:ro
+    depends_on:
+      - bgutil-provider
+    restart: unless-stopped
+
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    init: true
     restart: unless-stopped
 
 volumes:

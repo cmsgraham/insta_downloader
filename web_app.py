@@ -524,8 +524,10 @@ def download_youtube_video(video_url, dl_dir):
     return _ydl_download(
         video_url, dl_dir,
         ["youtube", "youtube:tab"], "video",
-        extractor_args={"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}},
-        js_runtimes={"node": {}},
+        extractor_args={
+            "youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS},
+            "youtubepot-bgutilhttp": {"base_url": ["http://bgutil-provider:4416"]},
+        },
     )
 
 
