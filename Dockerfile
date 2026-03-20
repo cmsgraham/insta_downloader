@@ -4,13 +4,10 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir bgutil-ytdlp-pot-provider && \
-    pip install --no-cache-dir "yt-dlp[default]"
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY web_app.py gunicorn.conf.py ./
 

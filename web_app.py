@@ -1,7 +1,7 @@
 """
-Instagram, Twitter/X & YouTube Downloader — Public Web Service
+Instagram & Twitter/X Downloader — Public Web Service
 Server uses the owner's cookies.txt for Instagram requests.
-Twitter/X and YouTube downloads use yt-dlp (no auth required).
+Twitter/X downloads use yt-dlp (no auth required).
 Visitors just paste a URL and hit Download.
 """
 
@@ -174,16 +174,6 @@ def parse_url(url):
     m = re.match(r"https?://t\.co/[A-Za-z0-9]+", url)
     if m:
         return ("tweet_short", url)
-    # YouTube URLs
-    m = re.match(r"https?://(?:www\.)?youtube\.com/watch\?.*v=([A-Za-z0-9_-]{11})", url)
-    if m:
-        return ("youtube", m.group(1))
-    m = re.match(r"https?://youtu\.be/([A-Za-z0-9_-]{11})", url)
-    if m:
-        return ("youtube", m.group(1))
-    m = re.match(r"https?://(?:www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{11})", url)
-    if m:
-        return ("youtube", m.group(1))
     return (None, None)
 
 
@@ -517,19 +507,6 @@ def download_twitter_video(tweet_url, dl_dir):
     return _ydl_download(tweet_url, dl_dir, ["twitter", "twitter:card"], "video")
 
 
-def download_youtube_video(video_url, dl_dir):
-    """Download video from YouTube using PO token provider."""
-    return _ydl_download(
-        video_url, dl_dir,
-        ["youtube", "youtube:tab"], "video",
-        extractor_args={
-            "youtube": {"player_client": ["web"], "fetch_pot": ["always"]},
-            "youtubepot-bgutilhttp": {"base_url": ["http://bgutil-provider:4416"]},
-        },
-        js_runtimes={"node": {}},
-    )
-
-
 # ──────────────────────────────────────────────
 #  Background download worker
 # ──────────────────────────────────────────────
@@ -538,20 +515,14 @@ def run_download(job_id, url, visitor):
     try:
         content_type, identifier = parse_url(url)
         if content_type is None:
-            visitor["jobs"][job_id] = {"status": "error", "message": "Could not parse URL. Supported: Instagram, Twitter/X & YouTube links.", "files": []}
+            visitor["jobs"][job_id] = {"status": "error", "message": "Could not parse URL. Supported: Instagram & Twitter/X links.", "files": []}
             return
 
         dl_dir = visitor["download_dir"]
         all_files = []
 
-        # ── YouTube downloads ──
-        if content_type == "youtube":
-            video_id = identifier
-            yt_url = f"https://www.youtube.com/watch?v={video_id}"
-            all_files = download_youtube_video(yt_url, dl_dir)
-
         # ── Twitter/X downloads ──
-        elif content_type in ("tweet", "tweet_short"):
+        if content_type in ("tweet", "tweet_short"):
             if content_type == "tweet_short":
                 url = _resolve_short_url(identifier)
                 content_type2, identifier2 = parse_url(url)
@@ -734,22 +705,22 @@ HTML_TEMPLATE = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
-<title>FreeDL — Download Instagram, Twitter/X & YouTube Videos Free</title>
-<meta name="description" content="Download Instagram reels, posts, stories, Twitter/X videos and YouTube videos for free. No login required. Just paste the link and download instantly.">
-<meta name="keywords" content="video downloader, instagram downloader, download instagram reels, download instagram stories, save instagram posts, instagram video downloader, twitter video downloader, x video downloader, download twitter videos, youtube downloader, download youtube videos, youtube shorts downloader, free video downloader">
+<title>FreeDL — Download Instagram & Twitter/X Videos Free</title>
+<meta name="description" content="Download Instagram reels, posts, stories and Twitter/X videos for free. No login required. Just paste the link and download instantly.">
+<meta name="keywords" content="video downloader, instagram downloader, download instagram reels, download instagram stories, save instagram posts, instagram video downloader, twitter video downloader, x video downloader, download twitter videos, free video downloader">
 <link rel="canonical" href="https://freedl.website/">
 
 <!-- Open Graph -->
-<meta property="og:title" content="FreeDL — Free Instagram, Twitter/X & YouTube Downloader">
-<meta property="og:description" content="Download Instagram reels, posts, stories, Twitter/X & YouTube videos for free. No login required.">
+<meta property="og:title" content="FreeDL — Free Instagram & Twitter/X Downloader">
+<meta property="og:description" content="Download Instagram reels, posts, stories & Twitter/X videos for free. No login required.">
 <meta property="og:url" content="https://freedl.website/">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="FreeDL">
 
 <!-- Twitter Card -->
 <meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="FreeDL — Free Instagram, Twitter/X & YouTube Downloader">
-<meta name="twitter:description" content="Download Instagram reels, posts, stories, Twitter/X & YouTube videos for free. No login required.">
+<meta name="twitter:title" content="FreeDL — Free Instagram & Twitter/X Downloader">
+<meta name="twitter:description" content="Download Instagram reels, posts, stories & Twitter/X videos for free. No login required.">
 <style>
     :root {
         --bg: #0a0a0a;
@@ -853,14 +824,14 @@ HTML_TEMPLATE = r"""
 <div class="container">
     <div class="logo">
         <h1>FreeDL — Video Downloader</h1>
-        <p>Download from Instagram, Twitter/X &amp; YouTube — no login required</p>
+        <p>Download from Instagram & Twitter/X — no login required</p>
     </div>
 
     <div class="card">
         <div class="field">
-            <label>Instagram, Twitter/X or YouTube URL</label>
+            <label>Instagram or Twitter/X URL</label>
             <div class="input-wrap">
-                <input type="url" id="url" placeholder="Paste Instagram, Twitter/X or YouTube link here..." autofocus>
+                <input type="url" id="url" placeholder="Paste Instagram or Twitter/X link here..." autofocus>
                 <button class="clear-btn" id="clearBtn" onclick="clearInput()" aria-label="Clear">&times;</button>
             </div>
         </div>
@@ -873,7 +844,6 @@ HTML_TEMPLATE = r"""
         <span>&#128247; Posts</span>
         <span>&#128248; Stories</span>
         <span>&#128038; Twitter/X</span>
-        <span>&#9654;&#65039; YouTube</span>
     </div>
 
     <div class="footer">
@@ -891,8 +861,7 @@ async function startDownload() {
     btn.disabled = true; btn.textContent = 'Downloading...';
     statusEl.className = 'status show working';
     const isTwitter = url.match(/twitter\.com|x\.com|t\.co/i);
-    const isYouTube = url.match(/youtube\.com|youtu\.be/i);
-    const source = isYouTube ? 'YouTube' : isTwitter ? 'Twitter/X' : 'Instagram';
+    const source = isTwitter ? 'Twitter/X' : 'Instagram';
     statusEl.innerHTML = '<span class="spinner"></span> Fetching from ' + source + '...';
     try {
         const resp = await fetch('/api/download', {
@@ -988,7 +957,7 @@ urlInput.addEventListener('focus', async () => {
     try {
         if (navigator.clipboard && navigator.clipboard.readText) {
             const text = await navigator.clipboard.readText();
-            if (text && text.match(/instagram\.com\/|twitter\.com\/|x\.com\/|youtube\.com\/|youtu\.be\//i)) {
+            if (text && text.match(/instagram\.com\/|twitter\.com\/|x\.com\//i)) {
                 urlInput.value = text.trim();
                 clearBtn.className = 'clear-btn show';
             }
@@ -1012,7 +981,7 @@ if __name__ == "__main__":
     import socket
     local_ip = socket.gethostbyname(socket.gethostname())
     print("=" * 45)
-    print("  FreeDL — Instagram, Twitter/X & YouTube Downloader")
+    print("  FreeDL — Instagram & Twitter/X Downloader")
     print(f"  Local:   http://localhost:5000")
     print(f"  Network: http://{local_ip}:5000")
     print("=" * 45)
