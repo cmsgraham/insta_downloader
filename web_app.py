@@ -458,8 +458,6 @@ def _resolve_short_url(url):
         return url
 
 
-YOUTUBE_PLAYER_CLIENTS = ["ios", "web_creator"]
-
 
 def _ydl_download(url, dl_dir, allowed_extractors, error_label="video",
                   extractor_args=None, cookie_file=None, js_runtimes=None):
@@ -525,6 +523,7 @@ def download_youtube_video(video_url, dl_dir):
         video_url, dl_dir,
         ["youtube", "youtube:tab"], "video",
         extractor_args={
+            "youtube": {"player_client": ["web"], "fetch_pot": ["always"]},
             "youtubepot-bgutilhttp": {"base_url": ["http://bgutil-provider:4416"]},
         },
         js_runtimes={"node": {}},
