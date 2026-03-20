@@ -520,12 +520,11 @@ def download_twitter_video(tweet_url, dl_dir):
 
 
 def download_youtube_video(video_url, dl_dir):
-    """Download video from YouTube using PO token provider + player clients."""
+    """Download video from YouTube using PO token provider."""
     return _ydl_download(
         video_url, dl_dir,
         ["youtube", "youtube:tab"], "video",
         extractor_args={
-            "youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS},
             "youtubepot-bgutilhttp": {"base_url": ["http://bgutil-provider:4416"]},
         },
     )
